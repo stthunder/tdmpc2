@@ -14,9 +14,11 @@ from common.parser import parse_cfg
 from common.seed import set_seed
 from common.buffer import Buffer
 from envs import make_env
+from mam_ode_modeler import MamODEModeler
 from tdmpc2 import TDMPC2
 from trainer.offline_trainer import OfflineTrainer
 from trainer.online_trainer import OnlineTrainer
+from trainer.model_trainer import ModelTrainer
 from common.logger import Logger
 
 torch.backends.cudnn.benchmark = True
@@ -49,10 +51,23 @@ def train(cfg: dict):
 	set_seed(cfg.seed)
 	print(colored('Work dir:', 'yellow', attrs=['bold']), cfg.work_dir)
 
+	env = make_env(cfg)
+	if cfg.get('model_only', False):
+		trainer = ModelTrainer(
+			cfg=cfg,
+			env=env,
+			agent=MamODEModeler(cfg),
+			buffer=Buffer(cfg),
+			logger=Logger(cfg),
+		)
+		trainer.train()
+		print('\nDynamics model training completed successfully')
+		return
+
 	trainer_cls = OfflineTrainer if cfg.multitask else OnlineTrainer
 	trainer = trainer_cls(
 		cfg=cfg,
-		env=make_env(cfg),
+		env=env,
 		agent=TDMPC2(cfg),
 		buffer=Buffer(cfg),
 		logger=Logger(cfg),

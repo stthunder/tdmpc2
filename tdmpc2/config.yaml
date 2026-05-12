@@ -28,7 +28,13 @@ discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1_000_000
 exp_name: default
-data_dir: ???
+data_dir: /home/lizhaoyang/Desktop/tdmpc2/datasets/mt30
+model_only: false
+log_freq: 1000
+save_freq: 50000
+plot_freq: 5000
+plot_dims: 8
+task_plot_batches: 8
 
 # planning
 mpc: true
@@ -52,6 +58,7 @@ vmin: -10
 vmax: +10
 
 # architecture
+world_model: tdmpc2
 model_size: ???
 num_enc_layers: 2
 enc_dim: 256
@@ -62,10 +69,14 @@ task_dim: 96
 num_q: 5
 dropout: 0.01
 simnorm_dim: 8
+mam_hidden_dim: 128
+mam_prune_dim: 8
+mam_ode_substeps: 1
+mam_dt: 0.1
 
 # logging
-wandb_project: ???
-wandb_entity: ???
+wandb_project: TDMPC
+wandb_entity: zhaoyangli1999-nanyang-technological-university-singapore
 wandb_silent: false
 enable_wandb: true
 save_csv: true

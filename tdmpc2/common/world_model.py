@@ -2,8 +2,10 @@ from copy import deepcopy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from common import layers, math, init
+from common.mam_ode_world_model import MamODEDynamics
 from tensordict import TensorDict
 from tensordict.nn import TensorDictParams
 
@@ -22,8 +24,15 @@ class WorldModel(nn.Module):
 			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
+			if cfg.get('world_model', 'tdmpc2') == 'mam_ode':
+				self.register_buffer("_obs_masks", torch.zeros(len(cfg.tasks), cfg.obs_shape[cfg.obs][0]))
+				for i in range(len(cfg.tasks)):
+					self._obs_masks[i, :cfg.obs_shapes[i]] = 1.
 		self._encoder = layers.enc(cfg)
-		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
+		if cfg.get('world_model', 'tdmpc2') == 'mam_ode':
+			self._dynamics = MamODEDynamics(cfg)
+		else:
+			self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
@@ -85,6 +94,10 @@ class WorldModel(nn.Module):
 		"""
 		self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
 
+	@property
+	def is_mam_ode(self):
+		return self.cfg.get('world_model', 'tdmpc2') == 'mam_ode'
+
 	def task_emb(self, x, task):
 		"""
 		Continuous task embedding for multi-task experiments.
@@ -111,10 +124,39 @@ class WorldModel(nn.Module):
 			return torch.stack([self._encoder[self.cfg.obs](o) for o in obs])
 		return self._encoder[self.cfg.obs](obs)
 
+	def mask_obs(self, obs, task):
+		"""
+		Mask padded observation dimensions for multi-task MamODE training.
+		"""
+		if not self.cfg.multitask or not hasattr(self, "_obs_masks"):
+			return obs
+		mask = self._obs_masks[task]
+		while mask.ndim < obs.ndim:
+			mask = mask.unsqueeze(0)
+		return obs * mask
+
+	def obs_loss(self, pred, target, task):
+		"""
+		MSE over non-padded observation dimensions.
+		"""
+		return F.mse_loss(self.mask_obs(pred, task), self.mask_obs(target, task))
+
+	def next_obs(self, z, a, task):
+		"""
+		Predict the next padded observation. Only used by MamODE dynamics.
+		"""
+		if self.cfg.multitask:
+			a = a * self._action_masks[task]
+			z = self.task_emb(z, task)
+		z = torch.cat([z, a], dim=-1)
+		return self.mask_obs(self._dynamics(z), task)
+
 	def next(self, z, a, task):
 		"""
 		Predicts the next latent state given the current latent state and action.
 		"""
+		if self.is_mam_ode:
+			return self.encode(self.next_obs(z, a, task), task)
 		if self.cfg.multitask:
 			z = self.task_emb(z, task)
 		z = torch.cat([z, a], dim=-1)

@@ -257,7 +257,35 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)
 
-	def _update(self, obs, action, reward, terminated, task=None):
+	def _update(self, obs, action, reward, terminated, task=None): # UPDATE THE LOSSES
+		if self.model.is_mam_ode:
+			self.model.train()
+			z = self.model.encode(obs[0], task)
+			x_preds = []
+			for _action in action.unbind(0):
+				x_pred = self.model.next_obs(z, _action, task)
+				x_preds.append(x_pred)
+				z = self.model.encode(x_pred, task)
+			x_preds = torch.stack(x_preds)
+			x_loss = self.model.obs_loss(x_preds, obs[1:], task)
+
+			x_loss.backward()
+			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
+			self.optim.step()
+			self.optim.zero_grad(set_to_none=True)
+
+			self.model.eval()
+			zero = x_loss.detach() * 0
+			return TensorDict({
+				"x_loss": x_loss,
+				"consistency_loss": x_loss,
+				"reward_loss": zero,
+				"value_loss": zero,
+				"termination_loss": zero,
+				"total_loss": x_loss,
+				"grad_norm": grad_norm,
+			}).detach().mean()
+
 		# Compute targets
 		with torch.no_grad():
 			next_z = self.model.encode(obs[1:], task)
