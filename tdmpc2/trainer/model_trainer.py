@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
+from common import TASK_SET
 from common.buffer import Buffer
 from trainer.base import Trainer
 
@@ -26,30 +27,111 @@ class ModelTrainer(Trainer):
 		fps = sorted(glob(str(fp)))
 		assert len(fps) > 0, f'No data found at {fp}'
 		print(f'Found {len(fps)} files in {fp}')
-		if len(fps) < (20 if self.cfg.task == 'mt80' else 4):
+		source_task = self.cfg.get('source_task', self.cfg.task)
+		if source_task is None or source_task is True:
+			source_task = self.cfg.task
+		if len(fps) < (20 if source_task == 'mt80' else 4):
 			print(f'WARNING: expected 20 files for mt80 task set, 4 files for mt30 task set, found {len(fps)} files.')
+		filter_task_id = None
+		if not self.cfg.multitask:
+			assert source_task in TASK_SET, \
+				'Single-task model-only training from offline data requires source_task=mt30 or source_task=mt80.'
+			assert self.cfg.task in TASK_SET[source_task], \
+				f'Task {self.cfg.task} is not in source task set {source_task}.'
+			filter_task_id = TASK_SET[source_task].index(self.cfg.task)
+			print(f'Filtering {source_task} dataset for task {self.cfg.task} (task id {filter_task_id}).')
 
 		_cfg = deepcopy(self.cfg)
-		_cfg.episode_length = 101 if self.cfg.task == 'mt80' else 501
-		_cfg.buffer_size = 550_450_000 if self.cfg.task == 'mt80' else 345_690_000
+		_cfg.episode_length = 101 if source_task == 'mt80' else 501
+		_cfg.buffer_size = 550_450_000 if source_task == 'mt80' else 345_690_000
 		_cfg.steps = _cfg.buffer_size
+		_cfg.horizon = self.cfg.get('model_history', 1) + self.cfg.horizon - 1
 		self.buffer = Buffer(_cfg)
+		self.test_buffer = Buffer(_cfg)
+		test_ratio = self.cfg.get('test_ratio', 0.1)
+		generator = torch.Generator().manual_seed(self.cfg.seed)
+		obs_dim = self.cfg.obs_shape[self.cfg.obs][0]
+		if self.cfg.multitask:
+			stat_shape = (len(self.cfg.tasks), obs_dim)
+		else:
+			stat_shape = (obs_dim,)
+		obs_sum = torch.zeros(stat_shape, dtype=torch.float64)
+		obs_sumsq = torch.zeros(stat_shape, dtype=torch.float64)
+		obs_count = torch.zeros(stat_shape, dtype=torch.float64)
+
+		def update_obs_stats(train_td):
+			obs = train_td['obs'].double()
+			if self.cfg.multitask:
+				task_ids = train_td['task'][:, 0].long()
+				for task_idx in torch.unique(task_ids).tolist():
+					task_obs = obs[task_ids == task_idx]
+					obs_size = self.cfg.obs_shapes[task_idx]
+					obs_sum[task_idx, :obs_size] += task_obs[:, :, :obs_size].sum(dim=(0, 1))
+					obs_sumsq[task_idx, :obs_size] += task_obs[:, :, :obs_size].square().sum(dim=(0, 1))
+					obs_count[task_idx, :obs_size] += task_obs.shape[0] * task_obs.shape[1]
+			else:
+				obs_sum[:] += obs.sum(dim=(0, 1))
+				obs_sumsq[:] += obs.square().sum(dim=(0, 1))
+				obs_count[:] += obs.shape[0] * obs.shape[1]
+
 		for fp in tqdm(fps, desc='Loading data'):
 			td = torch.load(fp, weights_only=False)
 			assert td.shape[1] == _cfg.episode_length, \
 				f'Expected episode length {td.shape[1]} to match config episode length {_cfg.episode_length}, ' \
 				f'please double-check your config.'
-			self.buffer.load(td)
+			if filter_task_id is not None:
+				task_mask = td['task'][:, 0] == filter_task_id
+				if not task_mask.any():
+					continue
+				td = td[task_mask]
+			num_eps = td.shape[0]
+			num_test = max(1, int(num_eps * test_ratio)) if test_ratio > 0 else 0
+			perm = torch.randperm(num_eps, generator=generator)
+			test_idx = perm[:num_test]
+			train_idx = perm[num_test:]
+			if len(train_idx) > 0:
+				train_td = td[train_idx]
+				update_obs_stats(train_td)
+				self.buffer.load(train_td)
+			if len(test_idx) > 0:
+				self.test_buffer.load(td[test_idx])
+		print(f'Train episodes: {self.buffer.num_eps:,}')
+		print(f'Test episodes: {self.test_buffer.num_eps:,}')
+		valid = obs_count > 0
+		mean = torch.zeros_like(obs_sum)
+		std = torch.ones_like(obs_sum)
+		mean[valid] = obs_sum[valid] / obs_count[valid]
+		var = torch.zeros_like(obs_sum)
+		var[valid] = obs_sumsq[valid] / obs_count[valid] - mean[valid].square()
+		std[valid] = var[valid].clamp_min(1e-12).sqrt()
+		self.agent.model.set_obs_stats(mean.float(), std.float())
+		print('Observation normalization statistics computed from train split.')
 
 	def _write_csv(self):
 		if not self.cfg.save_csv:
 			return
-		keys = ["iteration", "x_loss", "one_step_x_loss", "final_step_x_loss", "grad_norm", "elapsed_time"]
+		keys = [
+			"epoch",
+			"train_total_loss",
+			"train_x_loss",
+			"train_reward_loss",
+			"train_one_step_x_loss",
+			"train_final_step_x_loss",
+			"train_one_step_reward_loss",
+			"train_final_step_reward_loss",
+			"test_total_loss",
+			"test_x_loss",
+			"test_reward_loss",
+			"test_one_step_x_loss",
+			"test_final_step_x_loss",
+			"grad_norm",
+			"elapsed_time",
+		]
 		pd.DataFrame(self._history, columns=keys).to_csv(
 			Path(self.cfg.work_dir) / "model_loss.csv", index=None
 		)
 
-	def _plot_predictions(self, iteration):
+	def _plot_predictions(self, epoch):
 		try:
 			import matplotlib
 			matplotlib.use('Agg')
@@ -58,7 +140,7 @@ class ModelTrainer(Trainer):
 			print('matplotlib is not installed; skipping prediction plot.')
 			return
 
-		pred, target, task = self.agent.predict(self.buffer)
+		pred, target, task = self.agent.predict(self.test_buffer)
 		pred = pred.detach().cpu()
 		target = target.detach().cpu()
 		task = task.detach().cpu() if task is not None else None
@@ -66,7 +148,9 @@ class ModelTrainer(Trainer):
 		sample_idx = 0
 		pred_sample = pred[:, sample_idx]
 		target_sample = target[:, sample_idx]
-		per_dim_mse = ((pred - target) ** 2).mean(dim=(0, 1))
+		pred_norm = self.agent.model.normalize_obs(pred.to(self.agent.device), task.to(self.agent.device) if task is not None else None).cpu()
+		target_norm = self.agent.model.normalize_obs(target.to(self.agent.device), task.to(self.agent.device) if task is not None else None).cpu()
+		per_dim_mse = ((pred_norm - target_norm) ** 2).mean(dim=(0, 1))
 		valid_dims = torch.nonzero(target_sample.abs().sum(dim=0) > 0, as_tuple=False).flatten()
 		if len(valid_dims) == 0:
 			valid_dims = torch.arange(target_sample.shape[-1])
@@ -76,30 +160,35 @@ class ModelTrainer(Trainer):
 		dims = valid_dims[worst_dims].tolist()
 		horizon = pred_sample.shape[0]
 		t = np.arange(1, horizon + 1)
+		task_names = list(self.cfg.tasks)
 
 		fig, axes = plt.subplots(2, 1, figsize=(12, 8), constrained_layout=True)
 		for dim in dims:
 			axes[0].plot(t, target_sample[:, dim], linewidth=2, label=f'x{dim} target')
 			axes[0].plot(t, pred_sample[:, dim], '--', linewidth=2, label=f'x{dim} pred')
-		task_label = f'task {int(task[sample_idx])}' if task is not None else 'single task'
-		axes[0].set_title(f'MamODE rollout prediction at iteration {iteration} ({task_label})')
+		if task is not None:
+			task_idx = int(task[sample_idx])
+			task_label = task_names[task_idx] if task_idx < len(task_names) else str(task_idx)
+		else:
+			task_label = self.cfg.task
+		axes[0].set_title(f'MamODE test rollout prediction at epoch {epoch} ({task_label})')
 		axes[0].set_xlabel('prediction step')
 		axes[0].set_ylabel('state value')
 		axes[0].grid(True, alpha=0.3)
 		axes[0].legend(ncol=2, fontsize=8)
 
 		axes[1].bar(np.arange(len(per_dim_mse)), per_dim_mse.numpy())
-		axes[1].set_title('Per-state prediction MSE over sampled batch')
+		axes[1].set_title('Per-state normalized prediction MSE over sampled batch')
 		axes[1].set_xlabel('state dimension')
 		axes[1].set_ylabel('MSE')
 		axes[1].grid(True, axis='y', alpha=0.3)
 
 		out_dir = Path(self.cfg.work_dir) / "model_predictions"
 		out_dir.mkdir(parents=True, exist_ok=True)
-		fig.savefig(out_dir / f'prediction_{iteration:08d}.png', dpi=150)
+		fig.savefig(out_dir / f'prediction_epoch_{epoch:04d}.png', dpi=150)
 		plt.close(fig)
 
-	def _plot_task_error_distribution(self, iteration):
+	def _plot_task_error_distribution(self, epoch):
 		try:
 			import matplotlib
 			matplotlib.use('Agg')
@@ -108,16 +197,21 @@ class ModelTrainer(Trainer):
 			print('matplotlib is not installed; skipping task error plot.')
 			return
 
-		task_errors = {i: [] for i in range(len(self.cfg.tasks))}
+		task_names = list(self.cfg.tasks)
+		task_errors = {i: [] for i in range(len(task_names))}
 		num_batches = self.cfg.get('task_plot_batches', 8)
 		for _ in range(num_batches):
-			pred, target, task = self.agent.predict(self.buffer)
+			pred, target, task = self.agent.predict(self.test_buffer)
 			pred = pred.detach().cpu()
 			target = target.detach().cpu()
 			task = task.detach().cpu()
-			err = (pred - target) ** 2
+			pred_norm = self.agent.model.normalize_obs(pred.to(self.agent.device), task.to(self.agent.device)).cpu()
+			target_norm = self.agent.model.normalize_obs(target.to(self.agent.device), task.to(self.agent.device)).cpu()
+			err = (pred_norm - target_norm) ** 2
 
 			for b, task_idx in enumerate(task.tolist()):
+				if not self.cfg.multitask:
+					task_idx = 0
 				if hasattr(self.agent.model, "_obs_masks"):
 					mask = self.agent.model._obs_masks[task_idx].detach().cpu()
 					valid = mask.sum().clamp_min(1)
@@ -126,13 +220,12 @@ class ModelTrainer(Trainer):
 					sample_err = err[:, b].mean()
 				task_errors[task_idx].append(float(sample_err))
 
-		task_names = list(self.cfg.tasks)
 		data = [task_errors[i] if task_errors[i] else [np.nan] for i in range(len(task_names))]
 		means = np.array([np.nanmean(x) for x in data])
 
 		fig, axes = plt.subplots(2, 1, figsize=(16, 10), constrained_layout=True)
 		axes[0].boxplot(data, showfliers=False)
-		axes[0].set_title(f'Per-task rollout MSE distribution at iteration {iteration}')
+		axes[0].set_title(f'Per-task test rollout MSE distribution at epoch {epoch}')
 		axes[0].set_ylabel('MSE')
 		axes[0].set_xticks(np.arange(1, len(task_names) + 1))
 		axes[0].set_xticklabels(task_names, rotation=70, ha='right', fontsize=8)
@@ -148,48 +241,79 @@ class ModelTrainer(Trainer):
 
 		out_dir = Path(self.cfg.work_dir) / "model_predictions"
 		out_dir.mkdir(parents=True, exist_ok=True)
-		fig.savefig(out_dir / f'task_error_{iteration:08d}.png', dpi=150)
+		fig.savefig(out_dir / f'task_error_epoch_{epoch:04d}.png', dpi=150)
 		plt.close(fig)
 
 		pd.DataFrame({
 			"task": task_names,
 			"mean_mse": means,
 			"num_samples": [len(task_errors[i]) for i in range(len(task_names))],
-		}).to_csv(out_dir / f'task_error_{iteration:08d}.csv', index=None)
+		}).to_csv(out_dir / f'task_error_epoch_{epoch:04d}.csv', index=None)
 
 	def train(self):
-		assert self.cfg.multitask and self.cfg.task in {'mt30', 'mt80'}, \
-			'Model-only training currently supports multitask mt30/mt80 datasets.'
+		source_task = self.cfg.get('source_task', self.cfg.task)
+		if source_task is None or source_task is True:
+			source_task = self.cfg.task
+		assert (self.cfg.multitask and self.cfg.task in {'mt30', 'mt80'}) or source_task in {'mt30', 'mt80'}, \
+			'Model-only training supports mt30/mt80 or a single task filtered from source_task=mt30/mt80.'
 		self._load_dataset()
 
-		log_freq = self.cfg.get('log_freq', 1000)
-		plot_freq = self.cfg.get('plot_freq', 5000)
-		print(f'Training dynamics model for {self.cfg.steps} iterations...')
-		for i in range(self.cfg.steps):
-			metrics = self.agent.update(self.buffer)
-			if i % log_freq == 0 or i == self.cfg.steps - 1:
-				elapsed_time = time() - self._start_time
-				row = [
-					i,
-					float(metrics["x_loss"]),
-					float(metrics["one_step_x_loss"]),
-					float(metrics["final_step_x_loss"]),
-					float(metrics["grad_norm"]),
-					elapsed_time,
-				]
-				self._history.append(row)
-				print(
-					f'  model          I: {i:,}   '
-					f'x_loss: {row[1]:.6f}   '
-					f'one_step: {row[2]:.6f}   '
-					f'final_step: {row[3]:.6f}   '
-					f'T: {elapsed_time:.0f}s'
-				)
-				self._write_csv()
-				if plot_freq > 0 and (i % plot_freq == 0 or i == self.cfg.steps - 1):
-					self._plot_predictions(i)
-					self._plot_task_error_distribution(i)
-				if self.cfg.save_agent and i > 0 and i % self.cfg.save_freq == 0:
-					self.logger.save_agent(self.agent, identifier=f'{i}')
+		model_epochs = self.cfg.get('model_epochs', 100)
+		updates_per_epoch = self.cfg.get('updates_per_epoch', 1000)
+		eval_batches = self.cfg.get('eval_batches', 20)
+		plot_every_epochs = self.cfg.get('plot_every_epochs', 10)
+		save_every_epochs = self.cfg.get('save_every_epochs', 10)
+		print(f'Training dynamics model for {model_epochs} epochs x {updates_per_epoch} updates/epoch...')
+		for epoch in range(1, model_epochs + 1):
+			train_acc = {
+				"total_loss": 0.,
+				"x_loss": 0.,
+				"reward_loss": 0.,
+				"one_step_x_loss": 0.,
+				"final_step_x_loss": 0.,
+				"one_step_reward_loss": 0.,
+				"final_step_reward_loss": 0.,
+				"grad_norm": 0.,
+			}
+			for _ in range(updates_per_epoch):
+				metrics = self.agent.update(self.buffer)
+				for k in train_acc.keys():
+					train_acc[k] += float(metrics[k])
+			for k in train_acc.keys():
+				train_acc[k] /= updates_per_epoch
+
+			test_metrics = self.agent.evaluate(self.test_buffer, num_batches=eval_batches)
+			elapsed_time = time() - self._start_time
+			row = [
+				epoch,
+				train_acc["total_loss"],
+				train_acc["x_loss"],
+				train_acc["reward_loss"],
+				train_acc["one_step_x_loss"],
+				train_acc["final_step_x_loss"],
+				train_acc["one_step_reward_loss"],
+				train_acc["final_step_reward_loss"],
+				float(test_metrics["x_loss"] + self.cfg.get("reward_model_coef", 1.0) * test_metrics["reward_loss"]),
+				float(test_metrics["x_loss"]),
+				float(test_metrics["reward_loss"]),
+				float(test_metrics["one_step_x_loss"]),
+				float(test_metrics["final_step_x_loss"]),
+				train_acc["grad_norm"],
+				elapsed_time,
+			]
+			self._history.append(row)
+			print(
+				f'  epoch {epoch:04d}   '
+				f'train total/x/r: {row[1]:.6f} / {row[2]:.6f} / {row[3]:.6f}   '
+				f'test total/x/r: {row[8]:.6f} / {row[9]:.6f} / {row[10]:.6f}   '
+				f'grad: {row[13]:.3f}   T: {elapsed_time:.0f}s'
+			)
+			self._write_csv()
+
+			if plot_every_epochs > 0 and (epoch % plot_every_epochs == 0 or epoch == model_epochs):
+				self._plot_predictions(epoch)
+				self._plot_task_error_distribution(epoch)
+			if self.cfg.save_agent and save_every_epochs > 0 and (epoch % save_every_epochs == 0 or epoch == model_epochs):
+				self.logger.save_agent(self.agent, identifier=f'epoch_{epoch}')
 
 		self.logger.finish(self.agent)

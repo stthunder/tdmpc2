@@ -34,42 +34,82 @@ class MamODEModeler(torch.nn.Module):
 		state_dict = state_dict["model"] if "model" in state_dict else state_dict
 		self.model.load_state_dict(state_dict)
 
+	def _rollout(self, obs, action, reward, task):
+		O = self.cfg.get("model_history", 1)
+		H = self.cfg.horizon
+		obs_hist = obs[:O]
+		action_hist = action[:max(O-1, 0)]
+		future_actions = action[O-1:O-1+H]
+		reward_target = reward[O-1:O-1+H]
+		target = obs[O:O+H]
+
+		dyn_state = self.model.init_dynamics_history(obs_hist, action_hist, task)
+		x_preds_norm = []
+		x_preds = []
+		reward_preds = []
+		step_losses = []
+		reward_step_losses = []
+		for t, _action in enumerate(future_actions.unbind(0)):
+			x_pred_norm, reward_pred, dyn_state = self.model.step_obs_norm(dyn_state, _action, task)
+			x_preds_norm.append(x_pred_norm)
+			reward_preds.append(reward_pred)
+			step_losses.append(self.model.obs_loss(x_pred_norm, target[t], task))
+			reward_step_losses.append(self.model.reward_loss(reward_pred, reward_target[t]))
+			x_preds.append(self.model.denormalize_obs(x_pred_norm, task))
+		return (
+			torch.stack(x_preds_norm),
+			torch.stack(x_preds),
+			target,
+			torch.stack(reward_preds),
+			reward_target,
+			step_losses,
+			reward_step_losses,
+		)
+
 	@torch.no_grad()
 	def predict(self, buffer):
-		obs, action, _, _, task = buffer.sample()
+		obs, action, reward, _, task = buffer.sample()
 		self.model.eval()
 
-		z = self.model.encode(obs[0], task)
-		x_preds = []
-		for _action in action.unbind(0):
-			x_pred = self.model.next_obs(z, _action, task)
-			x_preds.append(x_pred)
-			z = self.model.encode(x_pred, task)
-
-		x_preds = torch.stack(x_preds)
-		target = self.model.mask_obs(obs[1:], task)
+		_, x_preds, target, _, _, _, _ = self._rollout(obs, action, reward, task)
 		x_preds = self.model.mask_obs(x_preds, task)
+		target = self.model.mask_obs(target, task)
 		return x_preds, target, task
 
+	@torch.no_grad()
+	def evaluate(self, buffer, num_batches=10):
+		self.model.eval()
+		x_loss, reward_loss, one_step_loss, final_step_loss = 0, 0, 0, 0
+		for _ in range(num_batches):
+			obs, action, reward, _, task = buffer.sample()
+			x_preds_norm, _, target, reward_preds, reward_target, step_losses, _ = self._rollout(obs, action, reward, task)
+			x_loss += self.model.obs_loss(x_preds_norm, target, task)
+			reward_loss += self.model.reward_loss(reward_preds, reward_target)
+			one_step_loss += step_losses[0]
+			final_step_loss += step_losses[-1]
+
+		num_batches = max(num_batches, 1)
+		return TensorDict({
+			"x_loss": x_loss / num_batches,
+			"reward_loss": reward_loss / num_batches,
+			"one_step_x_loss": one_step_loss / num_batches,
+			"final_step_x_loss": final_step_loss / num_batches,
+		}).detach().mean()
+
 	def update(self, buffer):
-		obs, action, _, _, task = buffer.sample()
+		obs, action, reward, _, task = buffer.sample()
 		self.model.train()
 
-		z = self.model.encode(obs[0], task)
-		x_preds = []
-		step_losses = []
-		for t, _action in enumerate(action.unbind(0)):
-			x_pred = self.model.next_obs(z, _action, task)
-			x_preds.append(x_pred)
-			step_losses.append(self.model.obs_loss(x_pred, obs[t+1], task))
-			z = self.model.encode(x_pred, task)
-
-		x_preds = torch.stack(x_preds)
-		x_loss = self.model.obs_loss(x_preds, obs[1:], task)
+		x_preds_norm, _, target, reward_preds, reward_target, step_losses, reward_step_losses = self._rollout(obs, action, reward, task)
+		x_loss = self.model.obs_loss(x_preds_norm, target, task)
+		reward_loss = self.model.reward_loss(reward_preds, reward_target)
+		total_loss = x_loss + self.cfg.get("reward_model_coef", 1.0) * reward_loss
 		one_step_loss = step_losses[0]
 		final_step_loss = step_losses[-1]
+		one_step_reward_loss = reward_step_losses[0]
+		final_step_reward_loss = reward_step_losses[-1]
 
-		x_loss.backward()
+		total_loss.backward()
 		grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 		self.optim.step()
 		self.optim.zero_grad(set_to_none=True)
@@ -77,7 +117,11 @@ class MamODEModeler(torch.nn.Module):
 		self.model.eval()
 		return TensorDict({
 			"x_loss": x_loss,
+			"reward_loss": reward_loss,
+			"total_loss": total_loss,
 			"one_step_x_loss": one_step_loss,
 			"final_step_x_loss": final_step_loss,
+			"one_step_reward_loss": one_step_reward_loss,
+			"final_step_reward_loss": final_step_reward_loss,
 			"grad_norm": grad_norm,
 		}).detach().mean()

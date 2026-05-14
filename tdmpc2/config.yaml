@@ -30,9 +30,15 @@ buffer_size: 1_000_000
 exp_name: default
 data_dir: /home/lizhaoyang/Desktop/tdmpc2/datasets/mt30
 model_only: false
-log_freq: 1000
-save_freq: 50000
-plot_freq: 5000
+source_task: ???
+test_ratio: 0.1
+model_epochs: 500
+updates_per_epoch: 1000
+eval_batches: 20
+model_history: 20
+reward_model_coef: 1.0
+plot_every_epochs: 10
+save_every_epochs: 10
 plot_dims: 8
 task_plot_batches: 8
 

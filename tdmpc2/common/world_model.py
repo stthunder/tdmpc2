@@ -28,6 +28,11 @@ class WorldModel(nn.Module):
 				self.register_buffer("_obs_masks", torch.zeros(len(cfg.tasks), cfg.obs_shape[cfg.obs][0]))
 				for i in range(len(cfg.tasks)):
 					self._obs_masks[i, :cfg.obs_shapes[i]] = 1.
+		if cfg.get('world_model', 'tdmpc2') == 'mam_ode':
+			obs_dim = cfg.obs_shape[cfg.obs][0]
+			stats_shape = (len(cfg.tasks), obs_dim) if cfg.multitask else (obs_dim,)
+			self.register_buffer("_obs_mean", torch.zeros(stats_shape))
+			self.register_buffer("_obs_std", torch.ones(stats_shape))
 		self._encoder = layers.enc(cfg)
 		if cfg.get('world_model', 'tdmpc2') == 'mam_ode':
 			self._dynamics = MamODEDynamics(cfg)
@@ -98,6 +103,14 @@ class WorldModel(nn.Module):
 	def is_mam_ode(self):
 		return self.cfg.get('world_model', 'tdmpc2') == 'mam_ode'
 
+	def set_obs_stats(self, mean, std):
+		"""
+		Set observation normalization statistics for MamODE model-only training.
+		Statistics are computed from the train split only.
+		"""
+		self._obs_mean.copy_(mean.to(self._obs_mean.device))
+		self._obs_std.copy_(std.to(self._obs_std.device).clamp_min(1e-6))
+
 	def task_emb(self, x, task):
 		"""
 		Continuous task embedding for multi-task experiments.
@@ -118,6 +131,8 @@ class WorldModel(nn.Module):
 		Encodes an observation into its latent representation.
 		This implementation assumes a single state-based observation.
 		"""
+		if self.is_mam_ode:
+			obs = self.normalize_obs(obs, task)
 		if self.cfg.multitask:
 			obs = self.task_emb(obs, task)
 		if self.cfg.obs == 'rgb' and obs.ndim == 5:
@@ -135,21 +150,88 @@ class WorldModel(nn.Module):
 			mask = mask.unsqueeze(0)
 		return obs * mask
 
-	def obs_loss(self, pred, target, task):
-		"""
-		MSE over non-padded observation dimensions.
-		"""
-		return F.mse_loss(self.mask_obs(pred, task), self.mask_obs(target, task))
+	def _obs_stats(self, obs, task):
+		if not self.cfg.multitask:
+			mean, std = self._obs_mean, self._obs_std
+		else:
+			mean, std = self._obs_mean[task], self._obs_std[task]
+		while mean.ndim < obs.ndim:
+			mean = mean.unsqueeze(0)
+			std = std.unsqueeze(0)
+		return mean, std
 
-	def next_obs(self, z, a, task):
+	def normalize_obs(self, obs, task):
 		"""
-		Predict the next padded observation. Only used by MamODE dynamics.
+		Normalize raw observations using train-split statistics.
+		"""
+		if not self.is_mam_ode:
+			return obs
+		mean, std = self._obs_stats(obs, task)
+		return self.mask_obs((obs - mean) / std, task)
+
+	def denormalize_obs(self, obs, task):
+		"""
+		Convert normalized observations back to raw state units.
+		"""
+		if not self.is_mam_ode:
+			return obs
+		mean, std = self._obs_stats(obs, task)
+		return self.mask_obs(obs * std + mean, task)
+
+	def obs_loss(self, pred_norm, target, task):
+		"""
+		MSE between normalized prediction and normalized target.
+		"""
+		return F.mse_loss(self.mask_obs(pred_norm, task), self.normalize_obs(target, task))
+
+	def reward_loss(self, pred, target):
+		"""
+		MSE between modeled reward and dataset reward.
+		"""
+		return F.mse_loss(pred, target)
+
+	def next_obs_norm(self, z, a, task):
+		"""
+		Predict the next padded observation in normalized state space.
+		Only used by MamODE dynamics training/evaluation.
 		"""
 		if self.cfg.multitask:
 			a = a * self._action_masks[task]
 			z = self.task_emb(z, task)
 		z = torch.cat([z, a], dim=-1)
 		return self.mask_obs(self._dynamics(z), task)
+
+	def init_dynamics_history(self, obs_hist, action_hist, task):
+		"""
+		Initialize MamODE dynamics from a history window.
+
+		Args:
+			obs_hist: (O, B, obs_dim), raw observations.
+			action_hist: (O-1, B, action_dim), actions before current obs.
+			task: (B,) task ids or None.
+		"""
+		z_hist = self.encode(obs_hist, task)
+		if self.cfg.multitask:
+			action_hist = action_hist * self._action_masks[task].unsqueeze(0)
+			task_emb = self._task_emb(task.long())
+		else:
+			task_emb = None
+		return self._dynamics.init_history(z_hist, action_hist, task_emb)
+
+	def step_obs_norm(self, dyn_state, a, task):
+		"""
+		Predict one normalized observation using a history-initialized MamODE state.
+		"""
+		if self.cfg.multitask:
+			a = a * self._action_masks[task]
+		x_norm, reward, dyn_state = self._dynamics.step(dyn_state, a)
+		return self.mask_obs(x_norm, task), reward, dyn_state
+
+	def next_obs(self, z, a, task):
+		"""
+		Predict the next padded observation in raw state units.
+		"""
+		return self.denormalize_obs(self.next_obs_norm(z, a, task), task)
 
 	def next(self, z, a, task):
 		"""
