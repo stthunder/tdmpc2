@@ -32,6 +32,8 @@ class MamODEModeler(torch.nn.Module):
 	def load(self, fp):
 		state_dict = torch.load(fp, map_location=torch.get_default_device(), weights_only=False)
 		state_dict = state_dict["model"] if "model" in state_dict else state_dict
+		state_dict.setdefault("_reward_mean", self.model._reward_mean)
+		state_dict.setdefault("_reward_std", self.model._reward_std)
 		self.model.load_state_dict(state_dict)
 
 	def _rollout(self, obs, action, reward, task):
@@ -54,7 +56,7 @@ class MamODEModeler(torch.nn.Module):
 			x_preds_norm.append(x_pred_norm)
 			reward_preds.append(reward_pred)
 			step_losses.append(self.model.obs_loss(x_pred_norm, target[t], task))
-			reward_step_losses.append(self.model.reward_loss(reward_pred, reward_target[t]))
+			reward_step_losses.append(self.model.reward_loss(reward_pred, reward_target[t], task))
 			x_preds.append(self.model.denormalize_obs(x_pred_norm, task))
 		return (
 			torch.stack(x_preds_norm),
@@ -62,18 +64,21 @@ class MamODEModeler(torch.nn.Module):
 			target,
 			torch.stack(reward_preds),
 			reward_target,
+			future_actions,
 			step_losses,
 			reward_step_losses,
 		)
 
 	@torch.no_grad()
-	def predict(self, buffer):
+	def predict(self, buffer, include_reward=False):
 		obs, action, reward, _, task = buffer.sample()
 		self.model.eval()
 
-		_, x_preds, target, _, _, _, _ = self._rollout(obs, action, reward, task)
+		_, x_preds, target, reward_preds, reward_target, future_actions, _, _ = self._rollout(obs, action, reward, task)
 		x_preds = self.model.mask_obs(x_preds, task)
 		target = self.model.mask_obs(target, task)
+		if include_reward:
+			return x_preds, target, reward_preds, reward_target, future_actions, task
 		return x_preds, target, task
 
 	@torch.no_grad()
@@ -82,9 +87,9 @@ class MamODEModeler(torch.nn.Module):
 		x_loss, reward_loss, one_step_loss, final_step_loss = 0, 0, 0, 0
 		for _ in range(num_batches):
 			obs, action, reward, _, task = buffer.sample()
-			x_preds_norm, _, target, reward_preds, reward_target, step_losses, _ = self._rollout(obs, action, reward, task)
+			x_preds_norm, _, target, reward_preds, reward_target, _, step_losses, _ = self._rollout(obs, action, reward, task)
 			x_loss += self.model.obs_loss(x_preds_norm, target, task)
-			reward_loss += self.model.reward_loss(reward_preds, reward_target)
+			reward_loss += self.model.reward_loss(reward_preds, reward_target, task)
 			one_step_loss += step_losses[0]
 			final_step_loss += step_losses[-1]
 
@@ -100,9 +105,9 @@ class MamODEModeler(torch.nn.Module):
 		obs, action, reward, _, task = buffer.sample()
 		self.model.train()
 
-		x_preds_norm, _, target, reward_preds, reward_target, step_losses, reward_step_losses = self._rollout(obs, action, reward, task)
+		x_preds_norm, _, target, reward_preds, reward_target, _, step_losses, reward_step_losses = self._rollout(obs, action, reward, task)
 		x_loss = self.model.obs_loss(x_preds_norm, target, task)
-		reward_loss = self.model.reward_loss(reward_preds, reward_target)
+		reward_loss = self.model.reward_loss(reward_preds, reward_target, task)
 		total_loss = x_loss + self.cfg.get("reward_model_coef", 1.0) * reward_loss
 		one_step_loss = step_losses[0]
 		final_step_loss = step_losses[-1]

@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../tdmpc2"
 
-CHECKPOINT=${1:-logs/mt30/1/mam_ode_mt30/models/epoch_300.pt}
+CHECKPOINT=${1:-logs/mt30/1/mam_ode_mt30/models/epoch_20.pt}
 
 if [[ ! -f "$CHECKPOINT" ]]; then
 	echo "Checkpoint not found: $CHECKPOINT"
@@ -24,8 +24,9 @@ python evaluate_mam_ode.py \
 	eval_episodes=1 \
 	model_history=20 \
 	horizon=20 \
-	+mam_mpc_action_penalty=0.001 \
+	+mam_mpc_action_penalty=0.1 \
 	+mam_mpc_delta_penalty=0.01 \
+	mam_mpc_reward_weight=5.0 \
 	+mam_mpc_terminal_weight=1.0 \
 	compile=false \
 	save_video=true

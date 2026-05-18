@@ -33,6 +33,9 @@ class WorldModel(nn.Module):
 			stats_shape = (len(cfg.tasks), obs_dim) if cfg.multitask else (obs_dim,)
 			self.register_buffer("_obs_mean", torch.zeros(stats_shape))
 			self.register_buffer("_obs_std", torch.ones(stats_shape))
+			reward_stats_shape = (len(cfg.tasks), 1) if cfg.multitask else (1,)
+			self.register_buffer("_reward_mean", torch.zeros(reward_stats_shape))
+			self.register_buffer("_reward_std", torch.ones(reward_stats_shape))
 		self._encoder = layers.enc(cfg)
 		if cfg.get('world_model', 'tdmpc2') == 'mam_ode':
 			self._dynamics = MamODEDynamics(cfg)
@@ -111,6 +114,17 @@ class WorldModel(nn.Module):
 		self._obs_mean.copy_(mean.to(self._obs_mean.device))
 		self._obs_std.copy_(std.to(self._obs_std.device).clamp_min(1e-6))
 
+	def set_reward_stats(self, mean, std):
+		"""
+		Set per-task reward normalization statistics for MamODE reward loss.
+		The reward model still predicts raw reward values.
+		"""
+		std_min = float(self.cfg.get("reward_std_min", 0.1))
+		mean = torch.nan_to_num(mean.to(self._reward_mean.device), nan=0.0, posinf=0.0, neginf=0.0)
+		std = torch.nan_to_num(std.to(self._reward_std.device), nan=1.0, posinf=1.0, neginf=1.0)
+		self._reward_mean.copy_(mean)
+		self._reward_std.copy_(std.clamp_min(std_min))
+
 	def task_emb(self, x, task):
 		"""
 		Continuous task embedding for multi-task experiments.
@@ -160,6 +174,16 @@ class WorldModel(nn.Module):
 			std = std.unsqueeze(0)
 		return mean, std
 
+	def _reward_stats(self, reward, task):
+		if not self.cfg.multitask:
+			mean, std = self._reward_mean, self._reward_std
+		else:
+			mean, std = self._reward_mean[task], self._reward_std[task]
+		while mean.ndim < reward.ndim:
+			mean = mean.unsqueeze(0)
+			std = std.unsqueeze(0)
+		return mean, std
+
 	def normalize_obs(self, obs, task):
 		"""
 		Normalize raw observations using train-split statistics.
@@ -178,17 +202,29 @@ class WorldModel(nn.Module):
 		mean, std = self._obs_stats(obs, task)
 		return self.mask_obs(obs * std + mean, task)
 
+	def normalize_reward(self, reward, task):
+		"""
+		Normalize raw rewards using train-split per-task statistics.
+		"""
+		if not self.is_mam_ode:
+			return reward
+		mean, std = self._reward_stats(reward, task)
+		std = torch.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(
+			float(self.cfg.get("reward_std_min", 0.1))
+		)
+		return (reward - mean) / std
+
 	def obs_loss(self, pred_norm, target, task):
 		"""
 		MSE between normalized prediction and normalized target.
 		"""
 		return F.mse_loss(self.mask_obs(pred_norm, task), self.normalize_obs(target, task))
 
-	def reward_loss(self, pred, target):
+	def reward_loss(self, pred, target, task):
 		"""
-		MSE between modeled reward and dataset reward.
+		MSE between modeled reward and dataset reward in normalized reward space.
 		"""
-		return F.mse_loss(pred, target)
+		return F.mse_loss(self.normalize_reward(pred, task), self.normalize_reward(target, task))
 
 	def next_obs_norm(self, z, a, task):
 		"""

@@ -8,7 +8,6 @@ import hydra
 import imageio
 import numpy as np
 import torch
-import torch.nn.functional as F
 from termcolor import colored
 
 from common.parser import parse_cfg
@@ -23,6 +22,20 @@ try:
 	from tqdm import tqdm
 except ImportError:
 	tqdm = None
+
+
+def print_eval_step(task, episode, step, action, reward, progress=None):
+	action_str = np.array2string(
+		action.detach().cpu().numpy(),
+		precision=4,
+		suppress_small=True,
+		separator=', ',
+	)
+	message = f'  {task} ep {episode} step {step} reward={reward:.6f} action={action_str}'
+	if progress is not None:
+		progress.write(message)
+	else:
+		print(message)
 
 
 class MamODEMPCAgent(torch.nn.Module):
@@ -47,10 +60,13 @@ class MamODEMPCAgent(torch.nn.Module):
 		self._last_action = None
 		self.last_solve_time = 0.0
 		self.last_solver_status = 'not_started'
+		self._build_qp_problem()
 
 	def load(self, fp):
 		state_dict = torch.load(fp, map_location=torch.get_default_device(), weights_only=False)
 		state_dict = state_dict['model'] if 'model' in state_dict else state_dict
+		state_dict.setdefault("_reward_mean", self.model._reward_mean)
+		state_dict.setdefault("_reward_std", self.model._reward_std)
 		self.model.load_state_dict(state_dict)
 
 	def _task_tensor(self, task, n=1):
@@ -87,21 +103,13 @@ class MamODEMPCAgent(torch.nn.Module):
 
 	@torch.no_grad()
 	def _local_matrices(self, dyn_state):
-		"""Extract a one-step linear dynamics and quadratic reward approximation."""
-		dynamics = self.model._dynamics
-		a = dyn_state["a"]
-		c = dyn_state["c"]
-		d = dyn_state["d"]
-		dt = F.softplus(dynamics.log_dt).item()
-		diag = dynamics.diag_head(a)[0]
-		control = dynamics.control_head(a).view(-1, dynamics.latent_dim, dynamics.action_dim)[0]
-		reward_c = dynamics.reward_c_head(c)[0] / dynamics.latent_dim
-		reward_d = dynamics.reward_d_head(d)[0, 0]
-		A_diag = (1.0 + dt * diag).detach().cpu().double().numpy()
-		B = (dt * control).detach().cpu().double().numpy()
-		C_diag = reward_c.detach().cpu().double().numpy()
-		D = float(reward_d.detach().cpu())
-		return A_diag, B, C_diag, D
+		"""Extract model-generated controller matrices."""
+		A_diag, B, C_diag, D, next_state = self.model._dynamics.controller_matrices(dyn_state)
+		A_diag                           = A_diag[0].detach().cpu().double().numpy()
+		B                                = B[0].detach().cpu().double().numpy()
+		C_diag                           = C_diag[0].detach().cpu().double().numpy()
+		D                                = D[0].detach().cpu().double().numpy()
+		return A_diag, B, C_diag, D, next_state
 
 	@torch.no_grad()
 	def _linearize_horizon(self, task):
@@ -112,17 +120,11 @@ class MamODEMPCAgent(torch.nn.Module):
 		A_list, B_list, C_list, D_list     = [], [], [], []
 
 		for k in range(H):
-			A_diag, B, C_diag, D = self._local_matrices(dyn_state)
+			A_diag, B, C_diag, D, dyn_state = self._local_matrices(dyn_state)
 			A_list.append(A_diag)
 			B_list.append(B)
 			C_list.append(C_diag)
 			D_list.append(D)
-			nominal_action = torch.as_tensor(
-				self._prev_actions[k], dtype=torch.float32, device=self.device
-			).unsqueeze(0)
-			if self.cfg.multitask:
-				nominal_action = nominal_action * self.model._action_masks[task_tensor]
-			_, _, dyn_state = self.model.step_obs_norm(dyn_state, nominal_action, task_tensor)
 		return z0, A_list, B_list, C_list, D_list, task_tensor
 
 	def _action_mask(self, task_tensor):
@@ -130,47 +132,69 @@ class MamODEMPCAgent(torch.nn.Module):
 			return np.ones(self.cfg.action_dim, dtype=np.float64)
 		return self.model._action_masks[task_tensor][0].detach().cpu().double().numpy()
 
-	def _solve_qp(self, z0, A_list, B_list, C_list, D_list, action_mask):
-		H = self.cfg.horizon
-		cp = self.cp
-		z_dim = self.cfg.latent_dim
-		a_dim = self.cfg.action_dim
-		u = cp.Variable((a_dim, H))
-		z = cp.Variable((z_dim, H + 1))
-		constraints = [z[:, 0] == z0, u <= 1.0, u >= -1.0]
-		invalid_actions = np.where(action_mask < 0.5)[0]
-		for idx in invalid_actions:
-			constraints.append(u[idx, :] == 0.0)
+	def _build_qp_problem(self):
+		H                    = self.cfg.horizon
+		cp                   = self.cp
+		z_dim                = self.cfg.latent_dim
+		a_dim                = self.cfg.action_dim
+		self.qp_u            = cp.Variable((a_dim, H))
+		self.qp_z            = cp.Variable((z_dim, H + 1))
+		self.qp_z0           = cp.Parameter(z_dim)
+		self.qp_action_bound = cp.Parameter((a_dim, H), nonneg=True)
+		self.qp_A            = [cp.Parameter(z_dim) for _ in range(H)]
+		self.qp_B            = [cp.Parameter((z_dim, a_dim)) for _ in range(H)]
+		self.qp_q            = [cp.Parameter(z_dim, nonneg=True) for _ in range(H)]
+		self.qp_D            = [cp.Parameter(z_dim) for _ in range(H)]
+		constraints = [
+			self.qp_z[:, 0] == self.qp_z0,
+			self.qp_u <= self.qp_action_bound,
+			self.qp_u >= -self.qp_action_bound,
+		]
 
-		action_penalty = float(self.cfg.get('mam_mpc_action_penalty', 1e-3))
-		delta_penalty = float(self.cfg.get('mam_mpc_delta_penalty', 1e-2))
+		action_penalty  = float(self.cfg.get('mam_mpc_action_penalty', 1e-3))
+		delta_penalty   = float(self.cfg.get('mam_mpc_delta_penalty', 1e-2))
+		reward_weight   = float(self.cfg.get('mam_mpc_reward_weight', 5.0))
 		terminal_weight = float(self.cfg.get('mam_mpc_terminal_weight', 1.0))
 		objective = 0
 
 		for k in range(H):
 			constraints.append(
-				z[:, k + 1] == cp.multiply(A_list[k], z[:, k]) + B_list[k] @ u[:, k]
+				self.qp_z[:, k + 1] == cp.multiply(self.qp_A[k], self.qp_z[:, k]) + self.qp_B[k] @ self.qp_u[:, k]
 			)
-			# Max reward z^T C z + D. CVXPY needs a convex minimization, so use
+			# Max reward C z^2 + D z. CVXPY needs a convex minimization, so use
 			# the concave part exactly and drop the non-convex positive curvature.
-			q = np.maximum(-C_list[k], 0.0) + 1e-8
 			weight = terminal_weight if k == H - 1 else 1.0
-			objective += weight * cp.sum(cp.multiply(q, cp.square(z[:, k + 1]))) - D_list[k]
-			objective += action_penalty * cp.sum_squares(u[:, k])
+			objective += reward_weight * weight * (
+				cp.sum(cp.multiply(self.qp_q[k], cp.square(self.qp_z[:, k + 1])))
+				- self.qp_D[k] @ self.qp_z[:, k + 1]
+			)
+			objective += action_penalty * cp.sum_squares(self.qp_u[:, k])
 			if k > 0:
-				objective += delta_penalty * cp.sum_squares(u[:, k] - u[:, k - 1])
+				objective += delta_penalty * cp.sum_squares(self.qp_u[:, k] - self.qp_u[:, k - 1])
 
-		problem = cp.Problem(cp.Minimize(objective), constraints)
+		self.qp_problem = cp.Problem(cp.Minimize(objective), constraints)
+
+	def _solve_qp(self, z0, A_list, B_list, C_list, D_list, action_mask):
+		H = self.cfg.horizon
+		cp = self.cp
+		self.qp_z0.value = z0
+		self.qp_action_bound.value = np.repeat(action_mask[:, None], H, axis=1)
+		for k in range(H):
+			self.qp_A[k].value = A_list[k]
+			self.qp_B[k].value = B_list[k]
+			self.qp_q[k].value = np.maximum(-C_list[k], 0.0) + 1e-8
+			self.qp_D[k].value = D_list[k]
+
 		start_time = time.time()
 		for solver in ('OSQP', 'CLARABEL', 'SCS'):
 			try:
-				problem.solve(solver=solver, warm_start=True, verbose=False)
+				self.qp_problem.solve(solver=solver, warm_start=True, verbose=False)
 			except Exception:
 				continue
 			self.last_solve_time = time.time() - start_time
-			self.last_solver_status = f'{solver}:{problem.status}'
-			if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and u.value is not None:
-				return np.asarray(u.value, dtype=np.float64).T
+			self.last_solver_status = f'{solver}:{self.qp_problem.status}'
+			if self.qp_problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and self.qp_u.value is not None:
+				return np.asarray(self.qp_u.value, dtype=np.float64).T
 		self.last_solve_time = time.time() - start_time
 		self.last_solver_status = 'failed'
 		return self._prev_actions.copy()
@@ -178,7 +202,7 @@ class MamODEMPCAgent(torch.nn.Module):
 	@torch.no_grad()
 	def plan(self, task=None, eval_mode=True):
 		z0, A_list, B_list, C_list, D_list, task_tensor = self._linearize_horizon(task)
-		action_mask = self._action_mask(task_tensor)
+		action_mask                                     = self._action_mask(task_tensor)
 		planned_actions = self._solve_qp(z0, A_list, B_list, C_list, D_list, action_mask)
 		planned_actions = np.clip(planned_actions, -1.0, 1.0) * action_mask[None, :]
 		action = planned_actions[0].copy()
@@ -205,10 +229,11 @@ def evaluate(cfg: dict):
 	cfg = parse_cfg(cfg)
 	set_seed(cfg.seed)
 	print(colored(f'Task: {cfg.task}', 'blue', attrs=['bold']))
-	print(colored(f'Model size: {cfg.get("model_size", "default")}', 'blue', attrs=['bold']))
+	print(colored(f'Model size: {cfg.get("model_size", "default")}', 'red', attrs=['bold']))
 	print(colored(f'Checkpoint: {cfg.checkpoint}', 'blue', attrs=['bold']))
 	print(colored(f'MPC horizon: {cfg.horizon}', 'blue', attrs=['bold']))
 	print(colored(f'History: {cfg.get("model_history", 1)}', 'blue', attrs=['bold']))
+	print(colored(f'MPC reward weight: {cfg.get("mam_mpc_reward_weight", 5.0)}', 'red', attrs=['bold']))
 
 	env   = make_env(cfg)
 	agent = MamODEMPCAgent(cfg)
@@ -244,6 +269,7 @@ def evaluate(cfg: dict):
 			while not done:
 				action = agent.act(obs, t0=t==0, eval_mode=True, task=task_idx)
 				obs, reward, done, info = env.step(action)
+				print_eval_step(task, i + 1, t, action, reward, progress)
 				ep_reward += reward
 				t += 1
 				if progress is not None:

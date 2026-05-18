@@ -13,5 +13,6 @@ python evaluate_mam_ode.py \
 	eval_episodes=10 \
 	model_history=20 \
 	horizon=20 \
+	mam_mpc_reward_weight=5.0 \
 	compile=false \
 	save_video=false
