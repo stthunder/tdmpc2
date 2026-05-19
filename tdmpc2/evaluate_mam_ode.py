@@ -60,6 +60,7 @@ class MamODEMPCAgent(torch.nn.Module):
 		self._last_action = None
 		self.last_solve_time = 0.0
 		self.last_solver_status = 'not_started'
+		self.last_plan_rewards = None
 		self._build_qp_problem()
 
 	def load(self, fp):
@@ -177,6 +178,7 @@ class MamODEMPCAgent(torch.nn.Module):
 	def _solve_qp(self, z0, A_list, B_list, C_list, D_list, action_mask):
 		H = self.cfg.horizon
 		cp = self.cp
+		self.last_plan_rewards = None
 		self.qp_z0.value = z0
 		self.qp_action_bound.value = np.repeat(action_mask[:, None], H, axis=1)
 		for k in range(H):
@@ -184,6 +186,15 @@ class MamODEMPCAgent(torch.nn.Module):
 			self.qp_B[k].value = B_list[k]
 			self.qp_q[k].value = np.maximum(-C_list[k], 0.0) + 1e-8
 			self.qp_D[k].value = D_list[k]
+
+		# Diagnostic: print reward matrix norms once to verify reward model is informative
+		if not hasattr(self, '_diag_printed'):
+			self._diag_printed = True
+			q_mean = np.mean([np.mean(np.abs(self.qp_q[k].value)) for k in range(H)])
+			d_mean = np.mean([np.mean(np.abs(self.qp_D[k].value)) for k in range(H)])
+			b_mean = np.mean([np.mean(np.abs(self.qp_B[k].value)) for k in range(H)])
+			a_mean = np.mean([np.mean(np.abs(self.qp_A[k].value - 1.0)) for k in range(H)])
+			print(f'[MPC diag] |C|={q_mean:.4e}  |D|={d_mean:.4e}  |B|={b_mean:.4e}  |A-I|={a_mean:.4e}')
 
 		start_time = time.time()
 		for solver in ('OSQP', 'CLARABEL', 'SCS'):
@@ -194,6 +205,11 @@ class MamODEMPCAgent(torch.nn.Module):
 			self.last_solve_time = time.time() - start_time
 			self.last_solver_status = f'{solver}:{self.qp_problem.status}'
 			if self.qp_problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and self.qp_u.value is not None:
+				z_plan = np.asarray(self.qp_z.value, dtype=np.float64).T
+				self.last_plan_rewards = np.asarray([
+					np.sum(C_list[k] * np.square(z_plan[k + 1])) + np.dot(D_list[k], z_plan[k + 1])
+					for k in range(H)
+				], dtype=np.float64)
 				return np.asarray(self.qp_u.value, dtype=np.float64).T
 		self.last_solve_time = time.time() - start_time
 		self.last_solver_status = 'failed'
@@ -205,6 +221,14 @@ class MamODEMPCAgent(torch.nn.Module):
 		action_mask                                     = self._action_mask(task_tensor)
 		planned_actions = self._solve_qp(z0, A_list, B_list, C_list, D_list, action_mask)
 		planned_actions = np.clip(planned_actions, -1.0, 1.0) * action_mask[None, :]
+		if self.cfg.get('mam_mpc_print_plan', False) and self.last_plan_rewards is not None:
+			reward_str = np.array2string(
+				self.last_plan_rewards,
+				precision=4,
+				suppress_small=True,
+				separator=', ',
+			)
+			print(f'  planned_reward={reward_str}')
 		action = planned_actions[0].copy()
 		self._prev_actions[:-1] = planned_actions[1:]
 		self._prev_actions[-1] = planned_actions[-1]
@@ -249,11 +273,16 @@ def evaluate(cfg: dict):
 		os.makedirs(video_dir, exist_ok=True)
 
 	scores = []
-	tasks = cfg.tasks if cfg.multitask else [cfg.task]
-	for task_idx, task in enumerate(tasks):
-		if not cfg.multitask:
-			task_idx = None
-		print(colored(f'[{task_idx + 1 if task_idx is not None else 1}/{len(tasks)}] {task}', 'cyan'))
+	if cfg.multitask:
+		task_items = list(enumerate(cfg.tasks))
+		eval_task = cfg.get('eval_task', None)
+		if eval_task not in {None, True, 'all'}:
+			task_items = [(idx, task) for idx, task in task_items if task == eval_task]
+			assert task_items, f'eval_task={eval_task} is not in task set {cfg.task}.'
+	else:
+		task_items = [(None, cfg.task)]
+	for task_num, (task_idx, task) in enumerate(task_items, start=1):
+		print(colored(f'[{task_num}/{len(task_items)}] {task}', 'cyan'))
 		ep_rewards, ep_successes = [], []
 		for i in range(cfg.eval_episodes):
 			obs, done, ep_reward, t = env.reset(task_idx=task_idx), False, 0, 0

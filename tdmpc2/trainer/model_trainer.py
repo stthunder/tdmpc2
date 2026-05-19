@@ -218,7 +218,7 @@ class ModelTrainer(Trainer):
 		for dim in dims:
 			axes[0].plot(t, target_sample[:, dim], linewidth=2, label=f'x{dim} target')
 			axes[0].plot(t, pred_sample[:, dim], '--', linewidth=2, label=f'x{dim} pred')
-		if task is not None:
+		if task is not None and task_idx is not None:
 			task_label = task_names[task_idx] if task_idx < len(task_names) else str(task_idx)
 		else:
 			task_label = self.cfg.task
@@ -276,12 +276,13 @@ class ModelTrainer(Trainer):
 			pred, target, task = self.agent.predict(self.test_buffer)
 			pred = pred.detach().cpu()
 			target = target.detach().cpu()
-			task = task.detach().cpu()
-			pred_norm = self.agent.model.normalize_obs(pred.to(self.agent.device), task.to(self.agent.device)).cpu()
-			target_norm = self.agent.model.normalize_obs(target.to(self.agent.device), task.to(self.agent.device)).cpu()
+			task = task.detach().cpu() if task is not None else None
+			pred_norm = self.agent.model.normalize_obs(pred.to(self.agent.device), task.to(self.agent.device) if task is not None else None).cpu()
+			target_norm = self.agent.model.normalize_obs(target.to(self.agent.device), task.to(self.agent.device) if task is not None else None).cpu()
 			err = (pred_norm - target_norm) ** 2
 
-			for b, task_idx in enumerate(task.tolist()):
+			task_indices = task.tolist() if task is not None else [0] * pred.shape[1]
+			for b, task_idx in enumerate(task_indices):
 				if not self.cfg.multitask:
 					task_idx = 0
 				if hasattr(self.agent.model, "_obs_masks"):
