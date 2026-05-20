@@ -36,6 +36,7 @@ model_epochs: 500
 updates_per_epoch: 1000
 eval_batches: 20
 model_history: 20
+state_model_coef:  1.0
 reward_model_coef: 0.1
 reward_std_min: 0.1
 plot_every_epochs: 10

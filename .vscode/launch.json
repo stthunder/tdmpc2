@@ -1,0 +1,68 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train: MamODE cheetah-run-front",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tdmpc2/train.py",
+            "python": "/home/lizhaoyang/.conda/envs/tdmpc2/bin/python",
+            "cwd": "${workspaceFolder}/tdmpc2",
+            "args": [
+                "task=cheetah-run-front",
+                "source_task=mt30",
+                "+pad_to_source_task=true",
+                "model_size=5",
+                "world_model=mam_ode",
+                "model_only=true",
+                "model_epochs=5",
+                "updates_per_epoch=10",
+                "exp_name=mam_ode_cheetah_run_front",
+                "compile=false",
+                "model_history=20",
+                "horizon=20",
+                "save_video=false",
+                "enable_wandb=false"
+            ],
+            "env": {
+                "MUJOCO_GL": "egl",
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Control: MamODE cheetah-run-front",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tdmpc2/evaluate_mam_ode.py",
+            "python": "/home/lizhaoyang/.conda/envs/tdmpc2/bin/python",
+            "cwd": "${workspaceFolder}/tdmpc2",
+            "args": [
+                "task=cheetah-run-front",
+                "source_task=mt30",
+                "+pad_to_source_task=true",
+                "model_size=5",
+                "world_model=mam_ode",
+                "checkpoint=logs/cheetah-run-front/1/mam_ode_cheetah_run_front/models/epoch_40.pt",
+                "eval_episodes=1",
+                "model_history=20",
+                "horizon=20",
+                "+mam_mpc_action_penalty=0.1",
+                "+mam_mpc_delta_penalty=0.1",
+                "mam_mpc_reward_weight=5.0",
+                "+mam_mpc_terminal_weight=1.0",
+                "+mam_mpc_print_plan=true",
+                "compile=false",
+                "save_video=false",
+                "enable_wandb=false"
+            ],
+            "env": {
+                "MUJOCO_GL": "egl",
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        }
+    ]
+}

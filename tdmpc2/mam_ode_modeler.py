@@ -108,7 +108,10 @@ class MamODEModeler(torch.nn.Module):
 		x_preds_norm, _, target, reward_preds, reward_target, _, step_losses, reward_step_losses = self._rollout(obs, action, reward, task)
 		x_loss = self.model.obs_loss(x_preds_norm, target, task)
 		reward_loss = self.model.reward_loss(reward_preds, reward_target, task)
-		total_loss = x_loss + self.cfg.get("reward_model_coef", 1.0) * reward_loss
+		total_loss = (
+			self.cfg.get("state_model_coef", 0.0) * x_loss +
+			self.cfg.get("reward_model_coef", 1.0) * reward_loss
+		)
 		one_step_loss = step_losses[0]
 		final_step_loss = step_losses[-1]
 		one_step_reward_loss = reward_step_losses[0]

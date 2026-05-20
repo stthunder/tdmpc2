@@ -48,7 +48,7 @@ class MamODEDynamics(nn.Module):
 		)
 		self.history_ab = nn.Sequential(
 			nn.Linear(history_dim, self.hidden_dim), nn.SiLU(),
-			nn.Linear(self.hidden_dim, 4 * self.prune_dim),
+			nn.Linear(self.hidden_dim, 5 * self.prune_dim),
 		)
 		self.context = nn.Sequential(
 			nn.Linear(context_dim, self.hidden_dim), nn.SiLU(),
@@ -56,7 +56,7 @@ class MamODEDynamics(nn.Module):
 		)
 		self.ab_init = nn.Sequential(
 			nn.Linear(context_dim, self.hidden_dim), nn.SiLU(),
-			nn.Linear(self.hidden_dim, 4 * self.prune_dim),
+			nn.Linear(self.hidden_dim, 5 * self.prune_dim),
 		)
 		self.a_ode = nn.Sequential(
 			nn.Linear(2 * self.prune_dim, self.hidden_dim), nn.SiLU(),
@@ -71,6 +71,10 @@ class MamODEDynamics(nn.Module):
 			nn.Linear(self.hidden_dim, self.prune_dim), nn.Tanh(),
 		)
 		self.d_ode = nn.Sequential(
+			nn.Linear(2 * self.prune_dim, self.hidden_dim), nn.SiLU(),
+			nn.Linear(self.hidden_dim, self.prune_dim), nn.Tanh(),
+		)
+		self.e_ode = nn.Sequential(
 			nn.Linear(2 * self.prune_dim, self.hidden_dim), nn.SiLU(),
 			nn.Linear(self.hidden_dim, self.prune_dim), nn.Tanh(),
 		)
@@ -94,17 +98,22 @@ class MamODEDynamics(nn.Module):
 			nn.Linear(self.prune_dim, self.hidden_dim), nn.SiLU(),
 			nn.Linear(self.hidden_dim, self.latent_dim),
 		)
+		self.reward_e_head = nn.Sequential(
+			nn.Linear(self.prune_dim, self.hidden_dim), nn.SiLU(),
+			nn.Linear(self.hidden_dim, 1),
+		)
 		self.log_dt = nn.Parameter(torch.tensor(math.log(math.exp(cfg.get("mam_dt", 0.1)) - 1.0)))
 
-	def reward_from_state(self, z, c, d):
+	def reward_from_state(self, z, c, d, e):
 		"""
-		Reward model: C z^2 + D z. C is diagonal for tractability.
+		Reward model: C z^2 + D z + E. C is diagonal for tractability.
 		"""
 		C_diag = -self.reward_c_head(c)
 		D_vec = self.reward_d_head(d)
-		return ((C_diag * z.square()) + (D_vec * z)).sum(dim=-1, keepdim=True) / self.latent_dim
+		E = self.reward_e_head(e)
+		return ((C_diag * z.square()) + (D_vec * z)).sum(dim=-1, keepdim=True) / self.latent_dim + E
 
-	def _ode_terms(self, a, b, c, d, context):
+	def _ode_terms(self, a, b, c, d, e, context):
 		"""
 		Shared MamODE factor generator.
 
@@ -115,13 +124,15 @@ class MamODEDynamics(nn.Module):
 		ode_input_b = torch.cat([b, context], dim=-1)
 		ode_input_c = torch.cat([c, context], dim=-1)
 		ode_input_d = torch.cat([d, context], dim=-1)
+		ode_input_e = torch.cat([e, context], dim=-1)
 		da          = self.a_ode(ode_input_a)
 		db          = self.b_ode(ode_input_b)
 		dc          = self.c_ode(ode_input_c)
 		dd          = self.d_ode(ode_input_d)
+		de          = self.e_ode(ode_input_e)
 		diag        = self.diag_head(a)
 		B_mat       = self.control_head(b).view(-1, self.latent_dim, self.action_dim)
-		return da, db, dc, dd, diag, B_mat
+		return da, db, dc, dd, de, diag, B_mat
 
 	def init_history(self, z_hist, action_hist, task_emb=None):
 		"""
@@ -145,13 +156,14 @@ class MamODEDynamics(nn.Module):
 		hist           = torch.cat([z_hist, task_seq, action_seq], dim=-1).permute(1, 2, 0)
 		hist           = F.silu(self.history_conv(hist))[..., -O:].mean(dim=-1)
 		context        = self.history_context(hist)
-		a, b, c, d     = self.history_ab(hist).chunk(4, dim=-1)
+		a, b, c, d, e  = self.history_ab(hist).chunk(5, dim=-1)
 		return {
 			"z": z_hist[-1],
 			"a": a,
 			"b": b,
 			"c": c,
 			"d": d,
+			"e": e,
 			"context": context,
 			"task_emb": task_emb,
 		}
@@ -162,30 +174,31 @@ class MamODEDynamics(nn.Module):
 		b = state["b"]
 		c = state["c"]
 		d = state["d"]
+		e = state["e"]
 		context  = state["context"]
 		task_emb = state["task_emb"]
-		dt       = F.softplus(self.log_dt) / max(self.ode_substeps, 1)
-
-		for _ in range(max(self.ode_substeps, 1)):
-			da, db, dc, dd, diag, B_mat = self._ode_terms(a, b, c, d, context)
-			dz          = diag * z + torch.einsum("bij,bj->bi", B_mat, action)
-			a = a + dt * da
-			b = b + dt * db
-			c = c + dt * dc
-			d = d + dt * dd
-			z = z + dt * dz
+		dt       = F.softplus(self.log_dt)
+		da, db, dc, dd, de, diag, B_mat = self._ode_terms(a, b, c, d, e, context)
+		dz       = diag * z + torch.einsum("bij,bj->bi", B_mat, action)
+		a        = a + dt * da
+		b        = b + dt * db
+		c        = c + dt * dc
+		d        = d + dt * dd
+		e        = e + dt * de
+		z        = z + dt * dz
 
 		if self.task_dim:
 			x = self.obs_head(torch.cat([z, task_emb], dim=-1))
 		else:
 			x = self.obs_head(z)
-		reward = self.reward_from_state(z, c, d)
+		reward = self.reward_from_state(z, c, d, e)
 		return x, reward, {
 			"z": z,
 			"a": a,
 			"b": b,
 			"c": c,
 			"d": d,
+			"e": e,
 			"context": context,
 			"task_emb": task_emb,
 		}
@@ -205,31 +218,29 @@ class MamODEDynamics(nn.Module):
 		b = state["b"]
 		c = state["c"]
 		d = state["d"]
+		e = state["e"]
 		context  = state["context"]
 		task_emb = state["task_emb"]
-		dt       = F.softplus(self.log_dt) / max(self.ode_substeps, 1)
-		A_diag   = torch.ones(z.shape[0], self.latent_dim, device=z.device, dtype=z.dtype)
-		B_accum  = torch.zeros(z.shape[0], self.latent_dim, self.action_dim, device=z.device, dtype=z.dtype)
-
-		for _ in range(max(self.ode_substeps, 1)):
-			da, db, dc, dd, diag, B_step = self._ode_terms(a, b, c, d, context)
-			step_A      = 1.0 + dt * diag
-			step_B      = dt * B_step
-			B_accum     = step_A.unsqueeze(-1) * B_accum + step_B
-			A_diag      = step_A * A_diag
-			a           = a + dt * da
-			b           = b + dt * db
-			c           = c + dt * dc
-			d           = d + dt * dd
+		dt       = F.softplus(self.log_dt)
+		da, db, dc, dd, de, diag, B_step = self._ode_terms(a, b, c, d, e, context)
+		A_diag   = 1.0 + dt * diag
+		B        = dt * B_step
+		a        = a + dt * da
+		b        = b + dt * db
+		c        = c + dt * dc
+		d        = d + dt * dd
+		e        = e + dt * de
 
 		C_diag = -self.reward_c_head(c) / self.latent_dim
 		D_vec  = self.reward_d_head(d) / self.latent_dim
-		return A_diag, B_accum, C_diag, D_vec, {
+		E      = self.reward_e_head(e)
+		return A_diag, B, C_diag, D_vec, E, {
 			"z": z,
 			"a": a,
 			"b": b,
 			"c": c,
 			"d": d,
+			"e": e,
 			"context": context,
 			"task_emb": task_emb,
 		}
@@ -251,17 +262,16 @@ class MamODEDynamics(nn.Module):
 		x                        = x.reshape(-1, x.shape[-1])
 		z, context_input, action = self._split(x)
 		context                  = self.context(context_input)
-		a, b, c, d               = self.ab_init(context_input).chunk(4, dim=-1)
-		dt                       = F.softplus(self.log_dt) / max(self.ode_substeps, 1)
-
-		for _ in range(max(self.ode_substeps, 1)):
-			da, db, dc, dd, diag, B_mat = self._ode_terms(a, b, c, d, context)
-			dz          = diag * z + torch.einsum("bij,bj->bi", B_mat, action)
-			a           = a + dt * da
-			b           = b + dt * db
-			c           = c + dt * dc
-			d           = d + dt * dd
-			z           = z + dt * dz
+		a, b, c, d, e            = self.ab_init(context_input).chunk(5, dim=-1)
+		dt                       = F.softplus(self.log_dt)
+		da, db, dc, dd, de, diag, B_mat = self._ode_terms(a, b, c, d, e, context)
+		dz                       = diag * z + torch.einsum("bij,bj->bi", B_mat, action)
+		a                        = a + dt * da
+		b                        = b + dt * db
+		c                        = c + dt * dc
+		d                        = d + dt * dd
+		e                        = e + dt * de
+		z                        = z + dt * dz
 
 		if self.task_dim:
 			x = self.obs_head(torch.cat([z, context_input[:, self.latent_dim:]], dim=-1))

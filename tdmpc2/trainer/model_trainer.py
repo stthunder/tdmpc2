@@ -355,20 +355,24 @@ class ModelTrainer(Trainer):
 			for k in train_acc.keys():
 				train_acc[k] /= updates_per_epoch
 
-			test_metrics = self.agent.evaluate(self.test_buffer, num_batches=eval_batches)
-			elapsed_time = time() - self._start_time
-			row = [
-				epoch,
-				train_acc["total_loss"],
-				train_acc["x_loss"],
-				train_acc["reward_loss"],
-				train_acc["one_step_x_loss"],
-				train_acc["final_step_x_loss"],
-				train_acc["one_step_reward_loss"],
-				train_acc["final_step_reward_loss"],
-				float(test_metrics["x_loss"] + self.cfg.get("reward_model_coef", 1.0) * test_metrics["reward_loss"]),
-				float(test_metrics["x_loss"]),
-				float(test_metrics["reward_loss"]),
+				test_metrics = self.agent.evaluate(self.test_buffer, num_batches=eval_batches)
+				elapsed_time = time() - self._start_time
+				test_total_loss = (
+					self.cfg.get("state_model_coef", 0.0) * test_metrics["x_loss"] +
+					self.cfg.get("reward_model_coef", 1.0) * test_metrics["reward_loss"]
+				)
+				row = [
+					epoch,
+					train_acc["total_loss"],
+					train_acc["x_loss"],
+					train_acc["reward_loss"],
+					train_acc["one_step_x_loss"],
+					train_acc["final_step_x_loss"],
+					train_acc["one_step_reward_loss"],
+					train_acc["final_step_reward_loss"],
+					float(test_total_loss),
+					float(test_metrics["x_loss"]),
+					float(test_metrics["reward_loss"]),
 				float(test_metrics["one_step_x_loss"]),
 				float(test_metrics["final_step_x_loss"]),
 				train_acc["grad_norm"],

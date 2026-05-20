@@ -24,14 +24,34 @@ except ImportError:
 	tqdm = None
 
 
-def print_eval_step(task, episode, step, action, reward, progress=None):
+def _fmt_optional(value):
+	if value is None:
+		return 'nan'
+	return f'{float(value):.6f}'
+
+
+def print_eval_step(task, episode, step, action, reward, agent, progress=None):
 	action_str = np.array2string(
 		action.detach().cpu().numpy(),
 		precision=4,
 		suppress_small=True,
 		separator=', ',
 	)
-	message = f'  {task} ep {episode} step {step} reward={reward:.6f} action={action_str}'
+	model_rewards = agent.last_model_plan_rewards
+	qp_rewards = agent.last_plan_rewards
+	model_first = model_rewards[0] if model_rewards is not None and len(model_rewards) else None
+	model_mean = np.mean(model_rewards) if model_rewards is not None and len(model_rewards) else None
+	qp_first = qp_rewards[0] if qp_rewards is not None and len(qp_rewards) else None
+	qp_mean = np.mean(qp_rewards) if qp_rewards is not None and len(qp_rewards) else None
+	message = (
+		f'  {task} ep {episode} step {step} '
+		f'env_reward={float(reward):.6f} '
+		f'model_reward={_fmt_optional(model_first)} '
+		f'model_reward_mean={_fmt_optional(model_mean)} '
+		f'qp_reward={_fmt_optional(qp_first)} '
+		f'qp_reward_mean={_fmt_optional(qp_mean)} '
+		f'action={action_str}'
+	)
 	if progress is not None:
 		progress.write(message)
 	else:
@@ -61,6 +81,7 @@ class MamODEMPCAgent(torch.nn.Module):
 		self.last_solve_time = 0.0
 		self.last_solver_status = 'not_started'
 		self.last_plan_rewards = None
+		self.last_model_plan_rewards = None
 		self._build_qp_problem()
 
 	def load(self, fp):
@@ -83,6 +104,7 @@ class MamODEMPCAgent(torch.nn.Module):
 		self._action_hist = [zero_action.clone() for _ in range(max(O-1, 0))]
 		self._last_action = None
 		self._prev_actions.fill(0)
+		self.last_model_plan_rewards = None
 
 	def _advance_history(self, obs):
 		obs = obs.to(self.device, non_blocking=True)
@@ -105,12 +127,13 @@ class MamODEMPCAgent(torch.nn.Module):
 	@torch.no_grad()
 	def _local_matrices(self, dyn_state):
 		"""Extract model-generated controller matrices."""
-		A_diag, B, C_diag, D, next_state = self.model._dynamics.controller_matrices(dyn_state)
+		A_diag, B, C_diag, D, E, next_state = self.model._dynamics.controller_matrices(dyn_state)
 		A_diag                           = A_diag[0].detach().cpu().double().numpy()
 		B                                = B[0].detach().cpu().double().numpy()
 		C_diag                           = C_diag[0].detach().cpu().double().numpy()
 		D                                = D[0].detach().cpu().double().numpy()
-		return A_diag, B, C_diag, D, next_state
+		E                                = float(E[0].detach().cpu())
+		return A_diag, B, C_diag, D, E, next_state
 
 	@torch.no_grad()
 	def _linearize_horizon(self, task):
@@ -118,15 +141,16 @@ class MamODEMPCAgent(torch.nn.Module):
 		obs_hist, action_hist, task_tensor = self._history_tensors(1, task)
 		dyn_state                          = self.model.init_dynamics_history(obs_hist, action_hist, task_tensor)
 		z0                                 = dyn_state["z"][0].detach().cpu().double().numpy()
-		A_list, B_list, C_list, D_list     = [], [], [], []
+		A_list, B_list, C_list, D_list, E_list = [], [], [], [], []
 
 		for k in range(H):
-			A_diag, B, C_diag, D, dyn_state = self._local_matrices(dyn_state)
+			A_diag, B, C_diag, D, E, dyn_state = self._local_matrices(dyn_state)
 			A_list.append(A_diag)
 			B_list.append(B)
 			C_list.append(C_diag)
 			D_list.append(D)
-		return z0, A_list, B_list, C_list, D_list, task_tensor
+			E_list.append(E)
+		return z0, A_list, B_list, C_list, D_list, E_list, task_tensor
 
 	def _action_mask(self, task_tensor):
 		if not self.cfg.multitask:
@@ -175,7 +199,7 @@ class MamODEMPCAgent(torch.nn.Module):
 
 		self.qp_problem = cp.Problem(cp.Minimize(objective), constraints)
 
-	def _solve_qp(self, z0, A_list, B_list, C_list, D_list, action_mask):
+	def _solve_qp(self, z0, A_list, B_list, C_list, D_list, E_list, action_mask):
 		H = self.cfg.horizon
 		cp = self.cp
 		self.last_plan_rewards = None
@@ -207,7 +231,7 @@ class MamODEMPCAgent(torch.nn.Module):
 			if self.qp_problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and self.qp_u.value is not None:
 				z_plan = np.asarray(self.qp_z.value, dtype=np.float64).T
 				self.last_plan_rewards = np.asarray([
-					np.sum(C_list[k] * np.square(z_plan[k + 1])) + np.dot(D_list[k], z_plan[k + 1])
+					np.sum(C_list[k] * np.square(z_plan[k + 1])) + np.dot(D_list[k], z_plan[k + 1]) + E_list[k]
 					for k in range(H)
 				], dtype=np.float64)
 				return np.asarray(self.qp_u.value, dtype=np.float64).T
@@ -216,11 +240,23 @@ class MamODEMPCAgent(torch.nn.Module):
 		return self._prev_actions.copy()
 
 	@torch.no_grad()
+	def _model_rollout_rewards(self, planned_actions, task):
+		obs_hist, action_hist, task_tensor = self._history_tensors(1, task)
+		dyn_state = self.model.init_dynamics_history(obs_hist, action_hist, task_tensor)
+		actions = torch.as_tensor(planned_actions, dtype=torch.float32, device=self.device)
+		rewards = []
+		for action in actions:
+			_, reward, dyn_state = self.model._dynamics.step(dyn_state, action.unsqueeze(0))
+			rewards.append(float(reward.squeeze().detach().cpu()))
+		return np.asarray(rewards, dtype=np.float64)
+
+	@torch.no_grad()
 	def plan(self, task=None, eval_mode=True):
-		z0, A_list, B_list, C_list, D_list, task_tensor = self._linearize_horizon(task)
+		z0, A_list, B_list, C_list, D_list, E_list, task_tensor = self._linearize_horizon(task)
 		action_mask                                     = self._action_mask(task_tensor)
-		planned_actions = self._solve_qp(z0, A_list, B_list, C_list, D_list, action_mask)
+		planned_actions = self._solve_qp(z0, A_list, B_list, C_list, D_list, E_list, action_mask)
 		planned_actions = np.clip(planned_actions, -1.0, 1.0) * action_mask[None, :]
+		self.last_model_plan_rewards = self._model_rollout_rewards(planned_actions, task)
 		if self.cfg.get('mam_mpc_print_plan', False) and self.last_plan_rewards is not None:
 			reward_str = np.array2string(
 				self.last_plan_rewards,
@@ -229,6 +265,13 @@ class MamODEMPCAgent(torch.nn.Module):
 				separator=', ',
 			)
 			print(f'  planned_reward={reward_str}')
+			model_reward_str = np.array2string(
+				self.last_model_plan_rewards,
+				precision=4,
+				suppress_small=True,
+				separator=', ',
+			)
+			print(f'  model_rollout_reward={model_reward_str}')
 		action = planned_actions[0].copy()
 		self._prev_actions[:-1] = planned_actions[1:]
 		self._prev_actions[-1] = planned_actions[-1]
@@ -298,7 +341,7 @@ def evaluate(cfg: dict):
 			while not done:
 				action = agent.act(obs, t0=t==0, eval_mode=True, task=task_idx)
 				obs, reward, done, info = env.step(action)
-				print_eval_step(task, i + 1, t, action, reward, progress)
+				print_eval_step(task, i + 1, t, action, reward, agent, progress)
 				ep_reward += reward
 				t += 1
 				if progress is not None:
