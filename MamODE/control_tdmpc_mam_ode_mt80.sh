@@ -3,13 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../tdmpc2"
 
-CHECKPOINT=${1:-logs/mt30/1/mam_ode_mt30/models/epoch_500.pt}
+CHECKPOINT=${1:-logs/mt80/1/mam_ode_mt80/models/epoch_500.pt}
 
 if [[ ! -f "$CHECKPOINT" ]]; then
 	echo "Checkpoint not found: $CHECKPOINT"
 	echo "Current directory: $(pwd)"
 	echo "Available MamODE checkpoints:"
-	find logs/mt30/1 -path '*/models/*.pt' | grep 'mam_ode_mt30' | sort | tail -20
+	find logs/mt80/1 -path '*/models/*.pt' 2>/dev/null | grep 'mam_ode_mt80' | sort | tail -20 || true
 	exit 1
 fi
 
@@ -17,13 +17,16 @@ CHECKPOINT=$(realpath "$CHECKPOINT")
 echo "Using checkpoint: $CHECKPOINT"
 
 python evaluate_mam_ode.py \
-	task=mt30 \
+	task=mt80 \
 	model_size=5 \
 	world_model=mam_ode \
+	mam_ode_solver=torchdiffeq \
+	mam_ode_method=rk4 \
 	checkpoint="$CHECKPOINT" \
 	eval_episodes=1 \
 	model_history=30 \
-	horizon=20 \
+	horizon=6 \
+	mam_mpc_time_points=1_2_3_10_40_80 \
 	+mam_mpc_action_penalty=0.01 \
 	+mam_mpc_delta_penalty=0.00 \
 	mam_mpc_reward_weight=1.0 \

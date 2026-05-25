@@ -29,7 +29,7 @@ class ModelTrainer(Trainer):
 		assert len(fps) > 0, f'No data found at {fp}'
 		print(f'Found {len(fps)} files in {fp}')
 		source_task = self.cfg.get('source_task', self.cfg.task)
-		if source_task is None or source_task is True:
+		if self.cfg.multitask or source_task is None or source_task is True or source_task not in TASK_SET:
 			source_task = self.cfg.task
 		if len(fps) < (20 if source_task == 'mt80' else 4):
 			print(f'WARNING: expected 20 files for mt80 task set, 4 files for mt30 task set, found {len(fps)} files.')
@@ -63,6 +63,21 @@ class ModelTrainer(Trainer):
 		reward_sum = torch.zeros(reward_stat_shape, dtype=torch.float64)
 		reward_sumsq = torch.zeros(reward_stat_shape, dtype=torch.float64)
 		reward_count = torch.zeros(reward_stat_shape, dtype=torch.float64)
+
+		def pad_to_model_dims(td):
+			obs_target_dim = self.cfg.obs_shape[self.cfg.obs][0]
+			action_target_dim = self.cfg.action_dim
+			obs_dim = td['obs'].shape[-1]
+			action_dim = td['action'].shape[-1]
+			assert obs_dim <= obs_target_dim, \
+				f'Dataset obs dim {obs_dim} exceeds model obs dim {obs_target_dim}.'
+			assert action_dim <= action_target_dim, \
+				f'Dataset action dim {action_dim} exceeds model action dim {action_target_dim}.'
+			if obs_dim < obs_target_dim:
+				td['obs'] = F.pad(td['obs'], (0, obs_target_dim - obs_dim))
+			if action_dim < action_target_dim:
+				td['action'] = F.pad(td['action'], (0, action_target_dim - action_dim))
+			return td
 
 		def update_stats(train_td):
 			obs = train_td['obs'].double()
@@ -108,6 +123,7 @@ class ModelTrainer(Trainer):
 				if not task_mask.any():
 					continue
 				td = td[task_mask]
+			td = pad_to_model_dims(td)
 			num_eps = td.shape[0]
 			num_test = max(1, int(num_eps * test_ratio)) if test_ratio > 0 else 0
 			perm = torch.randperm(num_eps, generator=generator)
@@ -325,7 +341,7 @@ class ModelTrainer(Trainer):
 
 	def train(self):
 		source_task = self.cfg.get('source_task', self.cfg.task)
-		if source_task is None or source_task is True:
+		if self.cfg.multitask or source_task is None or source_task is True or source_task not in TASK_SET:
 			source_task = self.cfg.task
 		assert (self.cfg.multitask and self.cfg.task in {'mt30', 'mt80'}) or source_task in {'mt30', 'mt80'}, \
 			'Model-only training supports mt30/mt80 or a single task filtered from source_task=mt30/mt80.'

@@ -4,12 +4,16 @@ set -euo pipefail
 cd "$(dirname "$0")/../tdmpc2"
 
 python train.py \
-	task=mt30 \
+	task=mt80 \
+	source_task=mt80 \
+	data_dir=/home/lizhaoyang/Desktop/tdmpc2/datasets/mt80 \
 	model_size=5 \
 	world_model=mam_ode \
+	mam_ode_solver=torchdiffeq \
+	mam_ode_method=rk4 \
 	model_only=true \
 	model_epochs=500 \
-	exp_name=mam_ode_mt30 \
+	exp_name=mam_ode_mt80 \
 	compile=false \
 	model_history=30 \
 	horizon=20 \

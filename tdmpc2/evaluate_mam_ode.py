@@ -30,6 +30,21 @@ def _fmt_optional(value):
 	return f'{float(value):.6f}'
 
 
+def _parse_time_points(value):
+	if value in (None, False, 'none', 'None', ''):
+		return None
+	if isinstance(value, (list, tuple)):
+		points = [int(v) for v in value]
+	else:
+		text = str(value)
+		for ch in ',;:/':
+			text = text.replace(ch, '_')
+		points = [int(v) for v in text.split('_') if v]
+	assert points and all(p > 0 for p in points), 'mam_mpc_time_points must contain positive integers.'
+	assert all(b > a for a, b in zip(points, points[1:])), 'mam_mpc_time_points must be strictly increasing.'
+	return points
+
+
 def print_eval_step(task, episode, step, action, reward, agent, progress=None):
 	action_str = np.array2string(
 		action.detach().cpu().numpy(),
@@ -74,7 +89,17 @@ class MamODEMPCAgent(torch.nn.Module):
 		self.cp = cp
 		self.model = WorldModel(cfg).to(self.device).eval()
 		assert self.model.is_mam_ode, 'MamODEMPCAgent requires world_model=mam_ode.'
-		self._prev_actions = np.zeros((self.cfg.horizon, self.cfg.action_dim), dtype=np.float64)
+		self.mpc_time_points = _parse_time_points(self.cfg.get('mam_mpc_time_points', None))
+		if self.mpc_time_points is None:
+			self.mpc_interval_steps = [1] * self.cfg.horizon
+		else:
+			prev = 0
+			self.mpc_interval_steps = []
+			for point in self.mpc_time_points:
+				self.mpc_interval_steps.append(point - prev)
+				prev = point
+		self.plan_horizon = len(self.mpc_interval_steps)
+		self._prev_actions = np.zeros((self.plan_horizon, self.cfg.action_dim), dtype=np.float64)
 		self._obs_hist = None
 		self._action_hist = None
 		self._last_action = None
@@ -136,15 +161,29 @@ class MamODEMPCAgent(torch.nn.Module):
 		return A_diag, B, C_diag, D, E, next_state
 
 	@torch.no_grad()
+	def _macro_matrices(self, dyn_state, interval_steps):
+		macro_A = None
+		macro_B = None
+		C_diag = D = E = None
+		for _ in range(int(interval_steps)):
+			A_diag, B, C_diag, D, E, dyn_state = self._local_matrices(dyn_state)
+			if macro_A is None:
+				macro_A = A_diag
+				macro_B = B
+			else:
+				macro_B = A_diag[:, None] * macro_B + B
+				macro_A = A_diag * macro_A
+		return macro_A, macro_B, C_diag, D, E, dyn_state
+
+	@torch.no_grad()
 	def _linearize_horizon(self, task):
-		H                                  = self.cfg.horizon
 		obs_hist, action_hist, task_tensor = self._history_tensors(1, task)
 		dyn_state                          = self.model.init_dynamics_history(obs_hist, action_hist, task_tensor)
 		z0                                 = dyn_state["z"][0].detach().cpu().double().numpy()
 		A_list, B_list, C_list, D_list, E_list = [], [], [], [], []
 
-		for k in range(H):
-			A_diag, B, C_diag, D, E, dyn_state = self._local_matrices(dyn_state)
+		for interval_steps in self.mpc_interval_steps:
+			A_diag, B, C_diag, D, E, dyn_state = self._macro_matrices(dyn_state, interval_steps)
 			A_list.append(A_diag)
 			B_list.append(B)
 			C_list.append(C_diag)
@@ -158,7 +197,7 @@ class MamODEMPCAgent(torch.nn.Module):
 		return self.model._action_masks[task_tensor][0].detach().cpu().double().numpy()
 
 	def _build_qp_problem(self):
-		H                    = self.cfg.horizon
+		H                    = self.plan_horizon
 		cp                   = self.cp
 		z_dim                = self.cfg.latent_dim
 		a_dim                = self.cfg.action_dim
@@ -200,7 +239,7 @@ class MamODEMPCAgent(torch.nn.Module):
 		self.qp_problem = cp.Problem(cp.Minimize(objective), constraints)
 
 	def _solve_qp(self, z0, A_list, B_list, C_list, D_list, E_list, action_mask):
-		H = self.cfg.horizon
+		H = self.plan_horizon
 		cp = self.cp
 		self.last_plan_rewards = None
 		self.qp_z0.value = z0
@@ -245,8 +284,9 @@ class MamODEMPCAgent(torch.nn.Module):
 		dyn_state = self.model.init_dynamics_history(obs_hist, action_hist, task_tensor)
 		actions = torch.as_tensor(planned_actions, dtype=torch.float32, device=self.device)
 		rewards = []
-		for action in actions:
-			_, reward, dyn_state = self.model._dynamics.step(dyn_state, action.unsqueeze(0))
+		for action, interval_steps in zip(actions, self.mpc_interval_steps):
+			for _ in range(int(interval_steps)):
+				_, reward, dyn_state = self.model._dynamics.step(dyn_state, action.unsqueeze(0))
 			rewards.append(float(reward.squeeze().detach().cpu()))
 		return np.asarray(rewards, dtype=np.float64)
 
@@ -299,6 +339,8 @@ def evaluate(cfg: dict):
 	print(colored(f'Model size: {cfg.get("model_size", "default")}', 'red', attrs=['bold']))
 	print(colored(f'Checkpoint: {cfg.checkpoint}', 'blue', attrs=['bold']))
 	print(colored(f'MPC horizon: {cfg.horizon}', 'blue', attrs=['bold']))
+	if cfg.get('mam_mpc_time_points', None) not in (None, False, 'none', 'None', ''):
+		print(colored(f'MPC time points: {cfg.get("mam_mpc_time_points")}', 'blue', attrs=['bold']))
 	print(colored(f'History: {cfg.get("model_history", 1)}', 'blue', attrs=['bold']))
 	print(colored(f'MPC reward weight: {cfg.get("mam_mpc_reward_weight", 5.0)}', 'red', attrs=['bold']))
 

@@ -4,6 +4,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+	from torchdiffeq import odeint
+except ImportError:
+	odeint = None
+
 
 class MamODEDynamics(nn.Module):
 	"""
@@ -32,6 +37,10 @@ class MamODEDynamics(nn.Module):
 		self.prune_dim = cfg.get("mam_prune_dim", 32)
 		self.hidden_dim = cfg.get("mam_hidden_dim", 128)
 		self.ode_substeps = cfg.get("mam_ode_substeps", 1)
+		self.ode_solver = cfg.get("mam_ode_solver", "manual")
+		self.ode_method = cfg.get("mam_ode_method", "rk4")
+		self.ode_rtol = cfg.get("mam_ode_rtol", 1e-3)
+		self.ode_atol = cfg.get("mam_ode_atol", 1e-4)
 
 		context_dim = self.latent_dim + self.task_dim
 		history_dim = self.latent_dim + self.task_dim + self.action_dim
@@ -104,6 +113,62 @@ class MamODEDynamics(nn.Module):
 		)
 		self.log_dt = nn.Parameter(torch.tensor(math.log(math.exp(cfg.get("mam_dt", 0.1)) - 1.0)))
 
+	def _pack_state(self, z, a, b, c, d, e):
+		return torch.cat([z, a, b, c, d, e], dim=-1)
+
+	def _unpack_state(self, y):
+		i = 0
+		z = y[..., i:i + self.latent_dim]
+		i += self.latent_dim
+		a = y[..., i:i + self.prune_dim]
+		i += self.prune_dim
+		b = y[..., i:i + self.prune_dim]
+		i += self.prune_dim
+		c = y[..., i:i + self.prune_dim]
+		i += self.prune_dim
+		d = y[..., i:i + self.prune_dim]
+		i += self.prune_dim
+		e = y[..., i:i + self.prune_dim]
+		return z, a, b, c, d, e
+
+	def _rhs(self, t, y, action, context):
+		z, a, b, c, d, e = self._unpack_state(y)
+		da, db, dc, dd, de, diag, B_mat = self._ode_terms(a, b, c, d, e, context)
+		dz = diag * z + torch.einsum("bij,bj->bi", B_mat, action)
+		return self._pack_state(dz, da, db, dc, dd, de)
+
+	def _integrate(self, z, a, b, c, d, e, action, context, step_scale=1.0):
+		dt = F.softplus(self.log_dt) * float(step_scale)
+		if self.ode_solver == "torchdiffeq":
+			if odeint is None:
+				raise ImportError("mam_ode_solver=torchdiffeq requires torchdiffeq to be installed.")
+			y0 = self._pack_state(z, a, b, c, d, e)
+			tspan = torch.stack([dt.new_zeros(()), dt])
+			func = lambda t, y: self._rhs(t, y, action, context)
+			sol = odeint(
+				func,
+				y0,
+				tspan,
+				method=self.ode_method,
+				rtol=float(self.ode_rtol),
+				atol=float(self.ode_atol),
+			)
+			return self._unpack_state(sol[-1])
+
+		steps = max(int(self.ode_substeps), 1)
+		sub_dt = dt / steps
+		for _ in range(steps):
+			dz, da, db, dc, dd, de = self._unpack_state(
+				self._rhs(sub_dt, self._pack_state(z, a, b, c, d, e), action, context)
+			)
+			z = z + sub_dt * dz
+			a = a + sub_dt * da
+			b = b + sub_dt * db
+			c = c + sub_dt * dc
+			d = d + sub_dt * dd
+			e = e + sub_dt * de
+		return z, a, b, c, d, e
+
 	def reward_from_state(self, z, c, d, e):
 		"""
 		Reward model: C z^2 + D z + E. C is diagonal for tractability.
@@ -168,7 +233,7 @@ class MamODEDynamics(nn.Module):
 			"task_emb": task_emb,
 		}
 
-	def step(self, state, action):
+	def step(self, state, action, step_scale=1.0):
 		z = state["z"]
 		a = state["a"]
 		b = state["b"]
@@ -177,15 +242,7 @@ class MamODEDynamics(nn.Module):
 		e = state["e"]
 		context  = state["context"]
 		task_emb = state["task_emb"]
-		dt       = F.softplus(self.log_dt)
-		da, db, dc, dd, de, diag, B_mat = self._ode_terms(a, b, c, d, e, context)
-		dz       = diag * z + torch.einsum("bij,bj->bi", B_mat, action)
-		a        = a + dt * da
-		b        = b + dt * db
-		c        = c + dt * dc
-		d        = d + dt * dd
-		e        = e + dt * de
-		z        = z + dt * dz
+		z, a, b, c, d, e = self._integrate(z, a, b, c, d, e, action, context, step_scale)
 
 		if self.task_dim:
 			x = self.obs_head(torch.cat([z, task_emb], dim=-1))
@@ -203,7 +260,7 @@ class MamODEDynamics(nn.Module):
 			"task_emb": task_emb,
 		}
 
-	def controller_matrices(self, state):
+	def controller_matrices(self, state, step_scale=1.0):
 		"""
 		Return the one-step matrices used by a Control.py-style MPC.
 
@@ -221,15 +278,12 @@ class MamODEDynamics(nn.Module):
 		e = state["e"]
 		context  = state["context"]
 		task_emb = state["task_emb"]
-		dt       = F.softplus(self.log_dt)
+		dt       = F.softplus(self.log_dt) * float(step_scale)
 		da, db, dc, dd, de, diag, B_step = self._ode_terms(a, b, c, d, e, context)
 		A_diag   = 1.0 + dt * diag
 		B        = dt * B_step
-		a        = a + dt * da
-		b        = b + dt * db
-		c        = c + dt * dc
-		d        = d + dt * dd
-		e        = e + dt * de
+		zero_action = z.new_zeros(z.shape[0], self.action_dim)
+		_, a, b, c, d, e = self._integrate(z, a, b, c, d, e, zero_action, context, step_scale)
 
 		C_diag = -self.reward_c_head(c) / self.latent_dim
 		D_vec  = self.reward_d_head(d) / self.latent_dim
@@ -263,15 +317,7 @@ class MamODEDynamics(nn.Module):
 		z, context_input, action = self._split(x)
 		context                  = self.context(context_input)
 		a, b, c, d, e            = self.ab_init(context_input).chunk(5, dim=-1)
-		dt                       = F.softplus(self.log_dt)
-		da, db, dc, dd, de, diag, B_mat = self._ode_terms(a, b, c, d, e, context)
-		dz                       = diag * z + torch.einsum("bij,bj->bi", B_mat, action)
-		a                        = a + dt * da
-		b                        = b + dt * db
-		c                        = c + dt * dc
-		d                        = d + dt * dd
-		e                        = e + dt * de
-		z                        = z + dt * dz
+		z, a, b, c, d, e          = self._integrate(z, a, b, c, d, e, action, context)
 
 		if self.task_dim:
 			x = self.obs_head(torch.cat([z, context_input[:, self.latent_dim:]], dim=-1))
