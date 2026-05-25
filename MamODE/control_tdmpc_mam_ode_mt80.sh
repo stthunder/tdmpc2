@@ -20,13 +20,10 @@ python evaluate_mam_ode.py \
 	task=mt80 \
 	model_size=5 \
 	world_model=mam_ode \
-	mam_ode_solver=torchdiffeq \
-	mam_ode_method=rk4 \
 	checkpoint="$CHECKPOINT" \
 	eval_episodes=1 \
 	model_history=30 \
-	horizon=6 \
-	mam_mpc_time_points=1_2_3_10_40_80 \
+	horizon=20 \
 	+mam_mpc_action_penalty=0.01 \
 	+mam_mpc_delta_penalty=0.00 \
 	mam_mpc_reward_weight=1.0 \

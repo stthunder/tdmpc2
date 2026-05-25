@@ -9,8 +9,6 @@ python train.py \
 	data_dir=/home/lizhaoyang/Desktop/tdmpc2/datasets/mt80 \
 	model_size=5 \
 	world_model=mam_ode \
-	mam_ode_solver=torchdiffeq \
-	mam_ode_method=rk4 \
 	model_only=true \
 	model_epochs=500 \
 	exp_name=mam_ode_mt80 \

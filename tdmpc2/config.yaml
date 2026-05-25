@@ -82,11 +82,6 @@ mam_hidden_dim: 128
 mam_prune_dim: 32
 mam_ode_substeps: 1
 mam_dt: 0.1
-mam_ode_solver: manual
-mam_ode_method: rk4
-mam_ode_rtol: 1e-3
-mam_ode_atol: 1e-4
-mam_mpc_time_points: null
 
 # logging
 wandb_project: TDMPC
