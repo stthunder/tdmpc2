@@ -237,7 +237,7 @@ class WorldModel(nn.Module):
 		z = torch.cat([z, a], dim=-1)
 		return self.mask_obs(self._dynamics(z), task)
 
-	def init_dynamics_history(self, obs_hist, action_hist, task):
+	def init_dynamics_history(self, obs_hist, action_hist, task, reward_hist=None):
 		"""
 		Initialize MamODE dynamics from a history window.
 
@@ -245,6 +245,7 @@ class WorldModel(nn.Module):
 			obs_hist: (O, B, obs_dim), raw observations.
 			action_hist: (O-1, B, action_dim), actions before current obs.
 			task: (B,) task ids or None.
+			reward_hist: (O-1, B, 1), rewards before the current obs.
 		"""
 		z_hist = self.encode(obs_hist, task)
 		if self.cfg.multitask:
@@ -252,7 +253,7 @@ class WorldModel(nn.Module):
 			task_emb = self._task_emb(task.long())
 		else:
 			task_emb = None
-		return self._dynamics.init_history(z_hist, action_hist, task_emb)
+		return self._dynamics.init_history(z_hist, action_hist, task_emb, reward_hist)
 
 	def step_obs_norm(self, dyn_state, a, task):
 		"""

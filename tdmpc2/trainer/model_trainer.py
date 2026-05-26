@@ -46,7 +46,13 @@ class ModelTrainer(Trainer):
 		_cfg.episode_length = 101 if source_task == 'mt80' else 501
 		_cfg.buffer_size = 550_450_000 if source_task == 'mt80' else 345_690_000
 		_cfg.steps = _cfg.buffer_size
-		_cfg.horizon = self.cfg.get('model_history', 1) + self.cfg.horizon - 1
+		cfg_terminal_horizon = self.cfg.get("mam_terminal_horizon", None)
+		terminal_horizon = self.cfg.horizon if cfg_terminal_horizon in (None, False) else int(cfg_terminal_horizon)
+		model_horizon = max(self.cfg.horizon, terminal_horizon)
+		_cfg.horizon = self.cfg.get('model_history', 1) + model_horizon - 1
+		assert _cfg.horizon + 1 <= _cfg.episode_length, \
+			f'Model history + horizon requires sequence length {_cfg.horizon + 1}, ' \
+			f'but {source_task} episodes have length {_cfg.episode_length}.'
 		self.buffer = Buffer(_cfg)
 		self.test_buffer = Buffer(_cfg)
 		test_ratio = self.cfg.get('test_ratio', 0.1)
@@ -171,6 +177,7 @@ class ModelTrainer(Trainer):
 			"train_total_loss",
 			"train_x_loss",
 			"train_reward_loss",
+			"train_terminal_value_loss",
 			"train_one_step_x_loss",
 			"train_final_step_x_loss",
 			"train_one_step_reward_loss",
@@ -178,6 +185,7 @@ class ModelTrainer(Trainer):
 			"test_total_loss",
 			"test_x_loss",
 			"test_reward_loss",
+			"test_terminal_value_loss",
 			"test_one_step_x_loss",
 			"test_final_step_x_loss",
 			"grad_norm",
@@ -358,6 +366,7 @@ class ModelTrainer(Trainer):
 				"total_loss": 0.,
 				"x_loss": 0.,
 				"reward_loss": 0.,
+				"terminal_value_loss": 0.,
 				"one_step_x_loss": 0.,
 				"final_step_x_loss": 0.,
 				"one_step_reward_loss": 0.,
@@ -371,24 +380,27 @@ class ModelTrainer(Trainer):
 			for k in train_acc.keys():
 				train_acc[k] /= updates_per_epoch
 
-				test_metrics = self.agent.evaluate(self.test_buffer, num_batches=eval_batches)
-				elapsed_time = time() - self._start_time
-				test_total_loss = (
-					self.cfg.get("state_model_coef", 0.0) * test_metrics["x_loss"] +
-					self.cfg.get("reward_model_coef", 1.0) * test_metrics["reward_loss"]
-				)
-				row = [
-					epoch,
-					train_acc["total_loss"],
-					train_acc["x_loss"],
-					train_acc["reward_loss"],
-					train_acc["one_step_x_loss"],
-					train_acc["final_step_x_loss"],
-					train_acc["one_step_reward_loss"],
-					train_acc["final_step_reward_loss"],
-					float(test_total_loss),
-					float(test_metrics["x_loss"]),
-					float(test_metrics["reward_loss"]),
+			test_metrics = self.agent.evaluate(self.test_buffer, num_batches=eval_batches)
+			elapsed_time = time() - self._start_time
+			test_total_loss = (
+				self.cfg.get("state_model_coef", 0.0) * test_metrics["x_loss"] +
+				self.cfg.get("reward_model_coef", 1.0) * test_metrics["reward_loss"] +
+				self.cfg.get("mam_terminal_value_coef", 0.0) * test_metrics["terminal_value_loss"]
+			)
+			row = [
+				epoch,
+				train_acc["total_loss"],
+				train_acc["x_loss"],
+				train_acc["reward_loss"],
+				train_acc["terminal_value_loss"],
+				train_acc["one_step_x_loss"],
+				train_acc["final_step_x_loss"],
+				train_acc["one_step_reward_loss"],
+				train_acc["final_step_reward_loss"],
+				float(test_total_loss),
+				float(test_metrics["x_loss"]),
+				float(test_metrics["reward_loss"]),
+				float(test_metrics["terminal_value_loss"]),
 				float(test_metrics["one_step_x_loss"]),
 				float(test_metrics["final_step_x_loss"]),
 				train_acc["grad_norm"],
@@ -397,9 +409,9 @@ class ModelTrainer(Trainer):
 			self._history.append(row)
 			print(
 				f'  epoch {epoch:04d}   '
-				f'train total/x/r: {row[1]:.6f} / {row[2]:.6f} / {row[3]:.6f}   '
-				f'test total/x/r: {row[8]:.6f} / {row[9]:.6f} / {row[10]:.6f}   '
-				f'grad: {row[13]:.3f}   T: {elapsed_time:.0f}s'
+				f'train total/x/r/t: {row[1]:.6f} / {row[2]:.6f} / {row[3]:.6f} / {row[4]:.6f}   '
+				f'test total/x/r/t: {row[9]:.6f} / {row[10]:.6f} / {row[11]:.6f} / {row[12]:.6f}   '
+				f'grad: {row[15]:.3f}   T: {elapsed_time:.0f}s'
 			)
 			self._write_csv()
 

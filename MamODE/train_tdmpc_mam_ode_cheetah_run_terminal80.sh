@@ -4,19 +4,19 @@ set -euo pipefail
 cd "$(dirname "$0")/../tdmpc2"
 
 python train.py \
-	task=mt80 \
-	source_task=mt80 \
-	data_dir=/home/lizhaoyang/Desktop/tdmpc2/datasets/mt80 \
+	task=cheetah-run \
+	source_task=mt30 \
+	+pad_to_source_task=true \
 	model_size=5 \
 	world_model=mam_ode \
 	model_only=true \
 	model_epochs=500 \
-	exp_name=mam_ode_mt80_terminal80 \
+	exp_name=mam_ode_cheetah_run_terminal80 \
 	compile=false \
-	model_history=20 \
+	model_history=30 \
 	horizon=20 \
 	mam_terminal_horizon=80 \
-	mam_terminal_value_coef=0.001 \
-	state_model_coef=1.0 \
-	reward_model_coef=0.1 \
+	mam_terminal_value_coef=0.01 \
+	state_model_coef=0.0 \
+	reward_model_coef=1.0 \
 	save_video=false
