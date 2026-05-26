@@ -84,7 +84,6 @@ mam_ode_substeps: 1
 mam_dt: 0.1
 mam_terminal_horizon: null
 mam_terminal_value_coef: 0.0
-mam_mpc_learned_terminal_weight: 0.0
 
 # logging
 wandb_project: TDMPC

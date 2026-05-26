@@ -32,11 +32,9 @@ class MamODEDynamics(nn.Module):
 		self.prune_dim = cfg.get("mam_prune_dim", 32)
 		self.hidden_dim = cfg.get("mam_hidden_dim", 128)
 		self.ode_substeps = cfg.get("mam_ode_substeps", 1)
-		self.use_reward_context = bool(cfg.get("mam_reward_context", False))
-		self.reward_context_dim = 1 if self.use_reward_context else 0
 
 		context_dim = self.latent_dim + self.task_dim
-		history_dim = self.latent_dim + self.task_dim + self.action_dim + self.reward_context_dim
+		history_dim = self.latent_dim + self.task_dim + self.action_dim
 		self.history_conv = nn.Conv1d(
 			history_dim,
 			history_dim,
@@ -140,18 +138,6 @@ class MamODEDynamics(nn.Module):
 		E = self.terminal_e_head(e)
 		return ((C_diag * z.square()) + (D_vec * z)).sum(dim=-1, keepdim=True) / self.latent_dim + E
 
-	def terminal_value_factors(self, state):
-		"""
-		Return quadratic terminal value factors C, D, E for MPC.
-		"""
-		c = state["c"]
-		d = state["d"]
-		e = state["e"]
-		C_diag = -self.terminal_c_head(c) / self.latent_dim
-		D_vec = self.terminal_d_head(d) / self.latent_dim
-		E = self.terminal_e_head(e)
-		return C_diag, D_vec, E
-
 	def _ode_terms(self, a, b, c, d, e, context):
 		"""
 		Shared MamODE factor generator.
@@ -173,7 +159,7 @@ class MamODEDynamics(nn.Module):
 		B_mat       = self.control_head(b).view(-1, self.latent_dim, self.action_dim)
 		return da, db, dc, dd, de, diag, B_mat
 
-	def init_history(self, z_hist, action_hist, task_emb=None, reward_hist=None):
+	def init_history(self, z_hist, action_hist, task_emb=None):
 		"""
 		Build MamODE rollout state from a history window.
 
@@ -181,7 +167,6 @@ class MamODEDynamics(nn.Module):
 			z_hist: (O, B, latent_dim), encoded normalized observations.
 			action_hist: (O-1, B, action_dim), actions before the current state.
 			task_emb: (B, task_dim) or None.
-			reward_hist: (O-1, B, 1), rewards before the current state.
 		"""
 		O, B, _        = z_hist.shape
 		if self.task_dim:
@@ -193,17 +178,7 @@ class MamODEDynamics(nn.Module):
 			action_seq = torch.cat([action_hist, pad], dim=0)
 		else:
 			action_seq = action_hist[-O:]
-		hist_parts = [z_hist, task_seq, action_seq]
-		if self.use_reward_context:
-			if reward_hist is None:
-				reward_hist = z_hist.new_zeros(max(O - 1, 0), B, 1)
-			if reward_hist.shape[0] == O - 1:
-				pad = reward_hist[-1:].clone() if reward_hist.shape[0] > 0 else z_hist.new_zeros(1, B, 1)
-				reward_seq = torch.cat([reward_hist, pad], dim=0)
-			else:
-				reward_seq = reward_hist[-O:]
-			hist_parts.append(reward_seq)
-		hist           = torch.cat(hist_parts, dim=-1).permute(1, 2, 0)
+		hist           = torch.cat([z_hist, task_seq, action_seq], dim=-1).permute(1, 2, 0)
 		hist           = F.silu(self.history_conv(hist))[..., -O:].mean(dim=-1)
 		context        = self.history_context(hist)
 		a, b, c, d, e  = self.history_ab(hist).chunk(5, dim=-1)

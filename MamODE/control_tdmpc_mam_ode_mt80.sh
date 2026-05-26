@@ -28,7 +28,6 @@ python evaluate_mam_ode.py \
 	+mam_mpc_delta_penalty=0.00 \
 	mam_mpc_reward_weight=1.0 \
 	+mam_mpc_terminal_weight=10.0 \
-	mam_mpc_learned_terminal_weight=1.0 \
 	+mam_mpc_print_plan=true \
 	compile=false \
 	save_video=true

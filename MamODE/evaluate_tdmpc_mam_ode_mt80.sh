@@ -14,6 +14,5 @@ python evaluate_mam_ode.py \
 	model_history=20 \
 	horizon=20 \
 	mam_mpc_reward_weight=1.0 \
-	mam_mpc_learned_terminal_weight=1.0 \
 	compile=false \
 	save_video=false

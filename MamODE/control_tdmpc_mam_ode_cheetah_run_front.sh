@@ -27,9 +27,9 @@ python evaluate_mam_ode.py \
 	model_history=20 \
 	horizon=20 \
 	+mam_mpc_action_penalty=0.01 \
-	+mam_mpc_delta_penalty=0.01 \
+	+mam_mpc_delta_penalty=0.001 \
 	mam_mpc_reward_weight=1.0 \
-	+mam_mpc_terminal_weight=10 \
+	+mam_mpc_terminal_weight=20 \
 	+mam_mpc_print_plan=true \
 	compile=false \
 	save_video=true

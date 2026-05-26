@@ -43,12 +43,11 @@ class MamODEModeler(torch.nn.Module):
 		terminal_horizon = H if cfg_terminal_horizon in (None, False) else max(int(cfg_terminal_horizon), H)
 		obs_hist = obs[:O]
 		action_hist = action[:max(O-1, 0)]
-		reward_hist = reward[:max(O-1, 0)]
 		future_actions = action[O-1:O-1+H]
 		reward_target = reward[O-1:O-1+H]
 		target = obs[O:O+H]
 
-		dyn_state = self.model.init_dynamics_history(obs_hist, action_hist, task, reward_hist)
+		dyn_state = self.model.init_dynamics_history(obs_hist, action_hist, task)
 		x_preds_norm = []
 		x_preds = []
 		reward_preds = []

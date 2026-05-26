@@ -11,10 +11,9 @@ python train.py \
 	world_model=mam_ode \
 	model_only=true \
 	model_epochs=500 \
-	exp_name=mam_ode_cheetah_run_front_terminal80_rewardctx \
+	exp_name=mam_ode_cheetah_run_front_terminal80 \
 	compile=false \
 	model_history=20 \
-	+mam_reward_context=true \
 	horizon=20 \
 	mam_terminal_horizon=20 \
 	mam_terminal_value_coef=0 \
