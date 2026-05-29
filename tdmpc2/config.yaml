@@ -87,6 +87,10 @@ mam_ode_method: rk4
 mam_ode_rtol: 1e-3
 mam_ode_atol: 1e-4
 mam_mpc_time_points: null
+mam_mpc_state_constraints: false
+mam_mpc_state_bound: 10.0
+mam_mpc_state_lower: null
+mam_mpc_state_upper: null
 
 # logging
 wandb_project: TDMPC

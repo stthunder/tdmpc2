@@ -3,13 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../tdmpc2"
 
-CHECKPOINT=${1:-logs/cheetah-run-front/1/mam_ode_cheetah_run_front/models/epoch_500.pt}
+CHECKPOINT=${1:-logs/cheetah-run-front/1/mam_ode_linear_obs_cheetah_run_front_z128/models/epoch_1000.pt}
 
 if [[ ! -f "$CHECKPOINT" ]]; then
 	echo "Checkpoint not found: $CHECKPOINT"
 	echo "Current directory: $(pwd)"
-	echo "Available cheetah-run-front MamODE checkpoints:"
-	find logs/cheetah-run-front/1 -path '*/models/*.pt' 2>/dev/null | grep 'mam_ode_cheetah_run_front' | sort | tail -20 || true
+	echo "Available cheetah-run-front MamODE linear-observation z128 checkpoints:"
+	find logs/cheetah-run-front/1 -path '*/models/*.pt' 2>/dev/null | grep 'mam_ode_linear_obs_cheetah_run_front_z128' | sort | tail -20 || true
 	exit 1
 fi
 
@@ -20,16 +20,18 @@ python evaluate_mam_ode.py \
 	task=cheetah-run-front \
 	source_task=mt30 \
 	+pad_to_source_task=true \
-	model_size=5 \
+	model_size=1 \
 	world_model=mam_ode \
 	checkpoint="$CHECKPOINT" \
 	eval_episodes=1 \
 	model_history=20 \
 	horizon=20 \
-	+mam_mpc_action_penalty=0.01 \
-	+mam_mpc_delta_penalty=0.01 \
-	mam_mpc_reward_weight=1.0 \
-	+mam_mpc_terminal_weight=10 \
+	+mam_mpc_action_penalty=0 \
+	+mam_mpc_delta_penalty=0.001 \
+	mam_mpc_reward_weight=1 \
+	+mam_mpc_terminal_weight=20 \
+	mam_mpc_state_constraints=false \
+	mam_mpc_state_bound=10.0 \
 	+mam_mpc_print_plan=true \
 	compile=false \
 	save_video=true

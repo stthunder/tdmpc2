@@ -45,6 +45,24 @@ def _parse_time_points(value):
 	return points
 
 
+def _bound_array(value, dim, default):
+	if value in (None, False, 'none', 'None', ''):
+		value = default
+	if isinstance(value, str):
+		text = value
+		for ch in ',;:/':
+			text = text.replace(ch, '_')
+		parts = [v for v in text.split('_') if v]
+		value = [float(v) for v in parts] if len(parts) > 1 else float(parts[0])
+	if np.isscalar(value):
+		return np.full(dim, float(value), dtype=np.float64)
+	arr = np.asarray(value, dtype=np.float64).reshape(-1)
+	if arr.size == 1:
+		return np.full(dim, float(arr[0]), dtype=np.float64)
+	assert arr.size == dim, f'Expected state constraint bound with {dim} entries, got {arr.size}.'
+	return arr
+
+
 def print_eval_step(task, episode, step, action, reward, agent, progress=None):
 	action_str = np.array2string(
 		action.detach().cpu().numpy(),
@@ -107,6 +125,7 @@ class MamODEMPCAgent(torch.nn.Module):
 		self.last_solver_status = 'not_started'
 		self.last_plan_rewards = None
 		self.last_model_plan_rewards = None
+		self.use_state_constraints = bool(self.cfg.get('mam_mpc_state_constraints', False))
 		self._build_qp_problem()
 
 	def load(self, fp):
@@ -152,44 +171,48 @@ class MamODEMPCAgent(torch.nn.Module):
 	@torch.no_grad()
 	def _local_matrices(self, dyn_state):
 		"""Extract model-generated controller matrices."""
-		A_diag, B, C_diag, D, E, next_state = self.model._dynamics.controller_matrices(dyn_state)
+		A_diag, B, C_diag, D, E, C_obs, b_obs, next_state = self.model._dynamics.controller_matrices(dyn_state)
 		A_diag                           = A_diag[0].detach().cpu().double().numpy()
 		B                                = B[0].detach().cpu().double().numpy()
 		C_diag                           = C_diag[0].detach().cpu().double().numpy()
 		D                                = D[0].detach().cpu().double().numpy()
 		E                                = float(E[0].detach().cpu())
-		return A_diag, B, C_diag, D, E, next_state
+		C_obs                            = C_obs[0].detach().cpu().double().numpy()
+		b_obs                            = b_obs[0].detach().cpu().double().numpy()
+		return A_diag, B, C_diag, D, E, C_obs, b_obs, next_state
 
 	@torch.no_grad()
 	def _macro_matrices(self, dyn_state, interval_steps):
 		macro_A = None
 		macro_B = None
-		C_diag = D = E = None
+		C_diag = D = E = C_obs = b_obs = None
 		for _ in range(int(interval_steps)):
-			A_diag, B, C_diag, D, E, dyn_state = self._local_matrices(dyn_state)
+			A_diag, B, C_diag, D, E, C_obs, b_obs, dyn_state = self._local_matrices(dyn_state)
 			if macro_A is None:
 				macro_A = A_diag
 				macro_B = B
 			else:
 				macro_B = A_diag[:, None] * macro_B + B
 				macro_A = A_diag * macro_A
-		return macro_A, macro_B, C_diag, D, E, dyn_state
+		return macro_A, macro_B, C_diag, D, E, C_obs, b_obs, dyn_state
 
 	@torch.no_grad()
 	def _linearize_horizon(self, task):
 		obs_hist, action_hist, task_tensor = self._history_tensors(1, task)
 		dyn_state                          = self.model.init_dynamics_history(obs_hist, action_hist, task_tensor)
 		z0                                 = dyn_state["z"][0].detach().cpu().double().numpy()
-		A_list, B_list, C_list, D_list, E_list = [], [], [], [], []
+		A_list, B_list, C_list, D_list, E_list, Cx_list, bx_list = [], [], [], [], [], [], []
 
 		for interval_steps in self.mpc_interval_steps:
-			A_diag, B, C_diag, D, E, dyn_state = self._macro_matrices(dyn_state, interval_steps)
+			A_diag, B, C_diag, D, E, C_obs, b_obs, dyn_state = self._macro_matrices(dyn_state, interval_steps)
 			A_list.append(A_diag)
 			B_list.append(B)
 			C_list.append(C_diag)
 			D_list.append(D)
 			E_list.append(E)
-		return z0, A_list, B_list, C_list, D_list, E_list, task_tensor
+			Cx_list.append(C_obs)
+			bx_list.append(b_obs)
+		return z0, A_list, B_list, C_list, D_list, E_list, Cx_list, bx_list, task_tensor
 
 	def _action_mask(self, task_tensor):
 		if not self.cfg.multitask:
@@ -201,6 +224,7 @@ class MamODEMPCAgent(torch.nn.Module):
 		cp                   = self.cp
 		z_dim                = self.cfg.latent_dim
 		a_dim                = self.cfg.action_dim
+		x_dim                = self.cfg.obs_shape[self.cfg.obs][0]
 		self.qp_u            = cp.Variable((a_dim, H))
 		self.qp_z            = cp.Variable((z_dim, H + 1))
 		self.qp_z0           = cp.Parameter(z_dim)
@@ -209,6 +233,10 @@ class MamODEMPCAgent(torch.nn.Module):
 		self.qp_B            = [cp.Parameter((z_dim, a_dim)) for _ in range(H)]
 		self.qp_q            = [cp.Parameter(z_dim, nonneg=True) for _ in range(H)]
 		self.qp_D            = [cp.Parameter(z_dim) for _ in range(H)]
+		self.qp_Cx           = [cp.Parameter((x_dim, z_dim)) for _ in range(H)]
+		self.qp_bx           = [cp.Parameter(x_dim) for _ in range(H)]
+		self.qp_x_lower      = cp.Parameter(x_dim)
+		self.qp_x_upper      = cp.Parameter(x_dim)
 		constraints = [
 			self.qp_z[:, 0] == self.qp_z0,
 			self.qp_u <= self.qp_action_bound,
@@ -225,6 +253,9 @@ class MamODEMPCAgent(torch.nn.Module):
 			constraints.append(
 				self.qp_z[:, k + 1] == cp.multiply(self.qp_A[k], self.qp_z[:, k]) + self.qp_B[k] @ self.qp_u[:, k]
 			)
+			if self.use_state_constraints:
+				x_next = self.qp_Cx[k] @ self.qp_z[:, k + 1] + self.qp_bx[k]
+				constraints += [self.qp_x_lower <= x_next, x_next <= self.qp_x_upper]
 			# Max reward C z^2 + D z. CVXPY needs a convex minimization, so use
 			# the concave part exactly and drop the non-convex positive curvature.
 			weight = terminal_weight if k == H - 1 else 1.0
@@ -238,17 +269,23 @@ class MamODEMPCAgent(torch.nn.Module):
 
 		self.qp_problem = cp.Problem(cp.Minimize(objective), constraints)
 
-	def _solve_qp(self, z0, A_list, B_list, C_list, D_list, E_list, action_mask):
+	def _solve_qp(self, z0, A_list, B_list, C_list, D_list, E_list, Cx_list, bx_list, action_mask):
 		H = self.plan_horizon
 		cp = self.cp
 		self.last_plan_rewards = None
 		self.qp_z0.value = z0
 		self.qp_action_bound.value = np.repeat(action_mask[:, None], H, axis=1)
+		x_dim = self.cfg.obs_shape[self.cfg.obs][0]
+		state_bound = float(self.cfg.get('mam_mpc_state_bound', 10.0))
+		self.qp_x_lower.value = _bound_array(self.cfg.get('mam_mpc_state_lower', None), x_dim, -state_bound)
+		self.qp_x_upper.value = _bound_array(self.cfg.get('mam_mpc_state_upper', None), x_dim, state_bound)
 		for k in range(H):
 			self.qp_A[k].value = A_list[k]
 			self.qp_B[k].value = B_list[k]
 			self.qp_q[k].value = np.maximum(-C_list[k], 0.0) + 1e-8
 			self.qp_D[k].value = D_list[k]
+			self.qp_Cx[k].value = Cx_list[k]
+			self.qp_bx[k].value = bx_list[k]
 
 		# Diagnostic: print reward matrix norms once to verify reward model is informative
 		if not hasattr(self, '_diag_printed'):
@@ -292,9 +329,9 @@ class MamODEMPCAgent(torch.nn.Module):
 
 	@torch.no_grad()
 	def plan(self, task=None, eval_mode=True):
-		z0, A_list, B_list, C_list, D_list, E_list, task_tensor = self._linearize_horizon(task)
+		z0, A_list, B_list, C_list, D_list, E_list, Cx_list, bx_list, task_tensor = self._linearize_horizon(task)
 		action_mask                                     = self._action_mask(task_tensor)
-		planned_actions = self._solve_qp(z0, A_list, B_list, C_list, D_list, E_list, action_mask)
+		planned_actions = self._solve_qp(z0, A_list, B_list, C_list, D_list, E_list, Cx_list, bx_list, action_mask)
 		planned_actions = np.clip(planned_actions, -1.0, 1.0) * action_mask[None, :]
 		self.last_model_plan_rewards = self._model_rollout_rewards(planned_actions, task)
 		if self.cfg.get('mam_mpc_print_plan', False) and self.last_plan_rewards is not None:
@@ -343,6 +380,7 @@ def evaluate(cfg: dict):
 		print(colored(f'MPC time points: {cfg.get("mam_mpc_time_points")}', 'blue', attrs=['bold']))
 	print(colored(f'History: {cfg.get("model_history", 1)}', 'blue', attrs=['bold']))
 	print(colored(f'MPC reward weight: {cfg.get("mam_mpc_reward_weight", 5.0)}', 'red', attrs=['bold']))
+	print(colored(f'MPC state constraints: {cfg.get("mam_mpc_state_constraints", False)}', 'red', attrs=['bold']))
 
 	env   = make_env(cfg)
 	agent = MamODEMPCAgent(cfg)

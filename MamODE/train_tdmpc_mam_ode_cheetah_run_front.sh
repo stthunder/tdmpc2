@@ -7,11 +7,11 @@ python train.py \
 	task=cheetah-run-front \
 	source_task=mt30 \
 	+pad_to_source_task=true \
-	model_size=5 \
+	model_size=1 \
 	world_model=mam_ode \
 	model_only=true \
-	model_epochs=500 \
-	exp_name=mam_ode_cheetah_run_front \
+	model_epochs=1000 \
+	exp_name=mam_ode_linear_obs_cheetah_run_front_z128 \
 	compile=false \
 	model_history=20 \
 	horizon=20 \

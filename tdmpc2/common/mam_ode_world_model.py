@@ -95,8 +95,12 @@ class MamODEDynamics(nn.Module):
 			nn.Linear(self.prune_dim, self.hidden_dim), nn.SiLU(),
 			nn.Linear(self.hidden_dim, self.latent_dim * self.action_dim),
 		)
-		self.obs_head = nn.Sequential(
-			nn.Linear(self.latent_dim + self.task_dim, self.hidden_dim), nn.SiLU(),
+		self.obs_matrix_head = nn.Sequential(
+			nn.Linear(self.prune_dim, self.hidden_dim), nn.SiLU(),
+			nn.Linear(self.hidden_dim, self.obs_dim * self.latent_dim),
+		)
+		self.obs_bias_head = nn.Sequential(
+			nn.Linear(self.prune_dim, self.hidden_dim), nn.SiLU(),
 			nn.Linear(self.hidden_dim, self.obs_dim),
 		)
 		self.reward_c_head = nn.Sequential(
@@ -178,6 +182,26 @@ class MamODEDynamics(nn.Module):
 		E = self.reward_e_head(e)
 		return ((C_diag * z.square()) + (D_vec * z)).sum(dim=-1, keepdim=True) / self.latent_dim + E
 
+	def obs_from_state(self, z, c, d, task_emb=None):
+		"""
+		Decode latent state to normalized observation.
+
+		Generate a local linear decoder x = C(c) z + b(d). The generated C/b
+		may change over time through the ODE factors, but the map is linear in z
+		for a fixed rollout state.
+		"""
+		C = self.obs_matrix_head(c).view(-1, self.obs_dim, self.latent_dim)
+		b = self.obs_bias_head(d)
+		return torch.einsum("boi,bi->bo", C, z) / math.sqrt(self.latent_dim) + b
+
+	def obs_matrices(self, c, d):
+		"""
+		Return the generated linear observation decoder x = C z + b.
+		"""
+		C = self.obs_matrix_head(c).view(-1, self.obs_dim, self.latent_dim) / math.sqrt(self.latent_dim)
+		b = self.obs_bias_head(d)
+		return C, b
+
 	def _ode_terms(self, a, b, c, d, e, context):
 		"""
 		Shared MamODE factor generator.
@@ -244,10 +268,7 @@ class MamODEDynamics(nn.Module):
 		task_emb = state["task_emb"]
 		z, a, b, c, d, e = self._integrate(z, a, b, c, d, e, action, context, step_scale)
 
-		if self.task_dim:
-			x = self.obs_head(torch.cat([z, task_emb], dim=-1))
-		else:
-			x = self.obs_head(z)
+		x = self.obs_from_state(z, c, d, task_emb)
 		reward = self.reward_from_state(z, c, d, e)
 		return x, reward, {
 			"z": z,
@@ -288,7 +309,8 @@ class MamODEDynamics(nn.Module):
 		C_diag = -self.reward_c_head(c) / self.latent_dim
 		D_vec  = self.reward_d_head(d) / self.latent_dim
 		E      = self.reward_e_head(e)
-		return A_diag, B, C_diag, D_vec, E, {
+		C_obs, b_obs = self.obs_matrices(c, d)
+		return A_diag, B, C_diag, D_vec, E, C_obs, b_obs, {
 			"z": z,
 			"a": a,
 			"b": b,
@@ -319,8 +341,6 @@ class MamODEDynamics(nn.Module):
 		a, b, c, d, e            = self.ab_init(context_input).chunk(5, dim=-1)
 		z, a, b, c, d, e          = self._integrate(z, a, b, c, d, e, action, context)
 
-		if self.task_dim:
-			x = self.obs_head(torch.cat([z, context_input[:, self.latent_dim:]], dim=-1))
-		else:
-			x = self.obs_head(z)
+		task_emb = context_input[:, self.latent_dim:] if self.task_dim else None
+		x = self.obs_from_state(z, c, d, task_emb)
 		return x.reshape(*leading_shape, self.obs_dim)
